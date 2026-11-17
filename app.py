@@ -1805,9 +1805,9 @@ def api_login():
 @app.get("/manifest.json")
 def manifest():
     m = {
-        "name": "SebastianCom Atendimento",
-        "short_name": "SebastianCom",
-        "description": "Painel de Atendimento WhatsApp SebastianCom",
+        "name": "Inteligência do Topo",
+        "short_name": "IDT Topo",
+        "description": "Central de Atendimento e Gestão Inteligência do Topo",
         "start_url": "/",
         "display": "standalone",
         "background_color": "#0b141a",
@@ -2329,6 +2329,145 @@ def api_bot_settings_set():
             c.execute("INSERT INTO settings(k,v) VALUES('bot_mode',?) "
                       "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (body["mode"],))
     return jsonify({"ok": True, "effective_mode": _bot_effective_mode()})
+
+
+@app.get("/api/clients")
+def api_clients():
+    out = []
+    if not CLIENTS_DIR.exists():
+        return jsonify(out)
+    for cdir in sorted(CLIENTS_DIR.iterdir()):
+        if not cdir.is_dir():
+            continue
+        cfg_path = cdir / "config.json"
+        if not cfg_path.exists():
+            continue
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            kb_path = cdir / "kb.json"
+            services_count = 0
+            faq_count = 0
+            if kb_path.exists():
+                try:
+                    with open(kb_path, "r", encoding="utf-8") as kbf:
+                        kb_data = json.load(kbf)
+                    services_count = len(kb_data.get("servicos") or [])
+                    faq_count = len(kb_data.get("faq") or [])
+                except Exception:
+                    pass
+            out.append({
+                "slug": cdir.name,
+                "display": cfg.get("display") or cfg.get("nome") or cdir.name,
+                "instance": cfg.get("instance") or cdir.name,
+                "owner_number": cfg.get("owner_number") or "",
+                "owner_name": cfg.get("owner_name") or "",
+                "model": cfg.get("model") or "auto/best-chat",
+                "enabled": cfg.get("enabled", True),
+                "services_count": services_count,
+                "faq_count": faq_count
+            })
+        except Exception:
+            continue
+    return jsonify(out)
+
+
+@app.get("/api/clients/<slug>")
+def api_client_get(slug):
+    cdir = CLIENTS_DIR / slug
+    if not cdir.exists() or not cdir.is_dir():
+        return jsonify({"error": "cliente nao encontrado"}), 404
+    cfg_path = cdir / "config.json"
+    kb_path = cdir / "kb.json"
+    cfg = {}
+    kb = {}
+    if cfg_path.exists():
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            pass
+    if kb_path.exists():
+        try:
+            with open(kb_path, "r", encoding="utf-8") as f:
+                kb = json.load(f)
+        except Exception:
+            pass
+    return jsonify({"slug": slug, "config": cfg, "kb": kb})
+
+
+@app.post("/api/clients/<slug>")
+def api_client_save(slug):
+    cdir = CLIENTS_DIR / slug
+    cdir.mkdir(parents=True, exist_ok=True)
+    data = request.get_json(silent=True) or {}
+    cfg = data.get("config")
+    kb = data.get("kb")
+    cfg_path = cdir / "config.json"
+    kb_path = cdir / "kb.json"
+    if cfg is not None:
+        cfg["nome"] = slug
+        if not cfg.get("knowledge_base"):
+            cfg["knowledge_base"] = str(kb_path)
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    if kb is not None:
+        with open(kb_path, "w", encoding="utf-8") as f:
+            json.dump(kb, f, ensure_ascii=False, indent=2)
+    instance = (cfg or {}).get("instance")
+    if instance and instance not in SESSIONS:
+        SESSIONS.append(instance)
+    return jsonify({"ok": True, "slug": slug})
+
+
+@app.post("/api/clients")
+def api_client_create():
+    import re
+    data = request.get_json(silent=True) or {}
+    slug = (data.get("slug") or "").strip().lower()
+    slug = re.sub(r"[^a-z0-9_-]", "", slug)
+    if not slug:
+        return jsonify({"error": "slug obrigatorio (apenas letras, numeros e hifens)"}), 400
+    cdir = CLIENTS_DIR / slug
+    if cdir.exists():
+        return jsonify({"error": "cliente ja existe"}), 409
+    cdir.mkdir(parents=True, exist_ok=True)
+    display = (data.get("display") or slug.title()).strip()
+    instance = (data.get("instance") or f"cli-{slug}").strip()
+    cfg = {
+        "nome": slug,
+        "display": display,
+        "instance": instance,
+        "owner_number": (data.get("owner_number") or "").strip(),
+        "owner_name": (data.get("owner_name") or "").strip(),
+        "knowledge_base": str(cdir / "kb.json"),
+        "model": "auto/best-chat",
+        "enabled": False,
+        "dry_run": True
+    }
+    kb = {
+        "negocio": {
+            "nome": display,
+            "descricao": (data.get("descricao") or "").strip(),
+            "endereco": (data.get("endereco") or "").strip(),
+            "whatsapp": (data.get("whatsapp") or data.get("owner_number") or "").strip(),
+            "fixo": ""
+        },
+        "horarios": {
+            "segunda_a_sexta": "08:00 - 18:00",
+            "sabado": "08:00 - 12:00",
+            "domingo": "fechado"
+        },
+        "servicos": [],
+        "faq": []
+    }
+    with open(cdir / "config.json", "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    with open(cdir / "kb.json", "w", encoding="utf-8") as f:
+        json.dump(kb, f, ensure_ascii=False, indent=2)
+    if instance not in SESSIONS:
+        SESSIONS.append(instance)
+    return jsonify({"ok": True, "slug": slug, "config": cfg, "kb": kb})
 
 
 @app.get("/api/kb")
