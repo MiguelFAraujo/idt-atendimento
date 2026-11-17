@@ -1455,6 +1455,29 @@ def bot_process_conversation(session, cid, mode, send=True, advance=True):
     if not last_in:
         return {"cid": cid, "action": "skip", "reason": "sem inbound"}
     inbound_text = last_in["body"] or ""
+
+    # Defense-in-depth safety checks
+    if conv["mode"] != "bot":
+        return {"cid": cid, "session": session, "action": "skip", "reason": "modo_humano"}
+
+    if conv["is_group"] and not BOT_GROUPS:
+        return {"cid": cid, "session": session, "action": "skip", "reason": "grupos_desativados"}
+
+    now = int(time.time())
+    msg_age = now - int(last_in["timestamp"] or 0)
+    if msg_age > 180:
+        if advance:
+            with db() as c:
+                c.execute("UPDATE conversations SET bot_last_inbound_id=? WHERE session=? AND id=?",
+                          (last_in["id"], session, cid))
+        return {"cid": cid, "session": session, "action": "skip", "reason": f"stale_inbound_{msg_age}s"}
+
+    if send:
+        effective_mode = _bot_effective_mode()
+        if effective_mode == "off":
+            return {"cid": cid, "session": session, "action": "skip", "reason": "bot_desligado"}
+        if not bot_allowed(session, cid):
+            return {"cid": cid, "session": session, "action": "skip", "reason": "fora_da_allowlist"}
     
     # HUMAN INTENT DETECTION - Check BEFORE LLM call
     handoff_triggers = cfg.get("handoff_triggers", [
@@ -1482,34 +1505,43 @@ def bot_process_conversation(session, cid, mode, send=True, advance=True):
     faq_match = match_faq(kb, inbound_text)
     if faq_match:
         reply = faq_match
-        # Send with buttons for sebastiancom
-        try:
-            sent_mid = waha_send_text(conv["session"], cid, reply)
-            _emit_bot_event(session, "bot_replied", {"cid": cid, "reply": reply, "sent_id": sent_mid, "source": "faq"})
-        except Exception as e:
-            return {"cid": cid, "session": session, "action": "error", "reason": f"send: {type(e).__name__}: {e}"}
+        sent_mid = None
+        if send:
+            try:
+                sent_mid = waha_send_text(conv["session"], cid, reply)
+                _emit_bot_event(session, "bot_replied", {"cid": cid, "reply": reply, "sent_id": sent_mid, "source": "faq"})
+            except Exception as e:
+                return {"cid": cid, "session": session, "action": "error", "reason": f"send: {type(e).__name__}: {e}"}
         
         now = int(time.time())
         today = _local_now().strftime("%Y-%m-%d")
         with db() as c:
-            upsert_message(c, {"id": sent_mid, "fromMe": True, "body": reply, "timestamp": now}, conv["session"], cid)
+            if sent_mid:
+                upsert_message(c, {"id": sent_mid, "fromMe": True, "body": reply, "timestamp": now}, conv["session"], cid)
             count = int(conv["bot_replies_count"] or 0) if conv["bot_replies_day"] == today else 0
-            count += 1
+            if send:
+                count += 1
+            stored = ("[DRY] " + reply) if not send else reply
             c.execute(
                 """UPDATE conversations SET
-                     bot_last_inbound_id=?,
-                     bot_last_reply_at=?,
-                     bot_last_reply=?,
+                     bot_last_inbound_id=CASE WHEN ? THEN ? ELSE bot_last_inbound_id END,
+                     bot_last_reply_at=CASE WHEN ? THEN ? ELSE bot_last_reply_at END,
+                     bot_last_reply=COALESCE(?, bot_last_reply),
                      bot_last_error=NULL,
                      bot_replies_day=?,
                      bot_replies_count=?
                    WHERE session=? AND id=?""",
-                (last_in["id"], now, reply, today, count, session, cid))
+                (1 if advance else 0, last_in["id"],
+                 1 if send else 0, now,
+                 stored, today, count, session, cid))
         BOT_STATE["last_reply"] = reply
-        BOT_STATE["replies"] += 1
+        if send:
+            BOT_STATE["replies"] += 1
+        else:
+            BOT_STATE["dry"] += 1
         BOT_STATE["last_error"] = None
-        print(json.dumps({"t": now_iso(), "bot": "reply", "cid": cid, "reason": "faq_match", "model": "faq", "dry": False}), flush=True)
-        return {"cid": cid, "session": session, "action": "reply", "reason": "faq_match", "model": "faq", "reply": reply, "sent_id": sent_mid, "dry": False}
+        print(json.dumps({"t": now_iso(), "bot": "reply", "cid": cid, "reason": "faq_match", "model": "faq", "dry": not send}), flush=True)
+        return {"cid": cid, "session": session, "action": "reply", "reason": "faq_match", "model": "faq", "reply": reply, "sent_id": sent_mid, "dry": not send}
 
     # --- Media handling: check if inbound has media (audio, image, video) ---
     # --- Media handling: check if inbound has media (audio, image, video) ---
@@ -1711,6 +1743,12 @@ def bot_once(mode, session=None):
         if not last_in or conv["bot_last_inbound_id"] == last_in["id"]:
             continue
         now = int(time.time())
+        msg_age = now - int(last_in["timestamp"] or 0)
+        if msg_age > 180:
+            with db() as c:
+                c.execute("UPDATE conversations SET bot_last_inbound_id=? WHERE session=? AND id=?",
+                          (last_in["id"], session, cid))
+            continue
         if (now - int(conv["bot_last_reply_at"] or 0)) < BOT_COOLDOWN:
             continue
         today = _local_now().strftime("%Y-%m-%d")
@@ -2420,8 +2458,9 @@ def webhook(token):
                     body = msg.get("body") or ("[midia]" if msg.get("hasMedia") else "")
                     notify = (session, cid, {"last": body, "count": 1})
                     # Agenda processamento sincrono do bot APOS fechar a conexao do webhook
-                    # para evitar deadlock SQLite (duas escritas concorrentes).
-                    bot_jobs.append((session, cid, msg_id))
+                    # apenas se o robo estiver ativado e o contato for autorizado
+                    if _bot_effective_mode() != "off" and bot_allowed(session, cid):
+                        bot_jobs.append((session, cid, msg_id))
         elif kind == "message.ack":
             for mid in (p.get("ids") or []):
                 c.execute("UPDATE messages SET ack=? WHERE id=?", (int(p.get("ack") or 0), str(mid)))
