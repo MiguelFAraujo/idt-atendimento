@@ -1,0 +1,16 @@
+# registro: 2026-11-14 | autor: opencode | modelo: big-pickle
+[Unit]
+Description=IDT Atendimento — app proprio de atendimento WhatsApp (Opcao B, sobre WAHA)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/miguel/services/idt-atendimento
+EnvironmentFile=/home/miguel/.config/idt-atendimento/env
+ExecStart=/usr/bin/python3 /home/miguel/services/idt-atendimento/app.py
+Restart=on-failure
+RestartSec=5
+MemoryMax=512M
+
+[Install]
+WantedBy=default.target

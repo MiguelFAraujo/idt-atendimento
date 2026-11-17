@@ -1,0 +1,17 @@
+# registro: 2026-11-15 | autor: opencode | modelo: big-pickle
+# Instancia F5 (piloto) — cliente cli-002-sebastiancom. Porta 8147.
+[Unit]
+Description=IDT Atendimento (piloto sebastiancom) — app proprio WhatsApp sobre WAHA
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/miguel/services/idt-atendimento
+EnvironmentFile=/home/miguel/.config/idt-atendimento/sebastiancom.env
+ExecStart=/usr/bin/python3 /home/miguel/services/idt-atendimento/app.py
+Restart=on-failure
+RestartSec=5
+MemoryMax=512M
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,427 @@
+# PATCH: Multi-tenancy + Handoff fixes for app.py
+# Apply with: patch -p1 < app.py.patch
+
+--- a/app.py
++++ b/app.py
+@@ -527,7 +527,10 @@ def message_exists(c, mid):
+ 
+ 
+ def upsert_message(c, m, session, conv_id):
++    # Get tenant_id from client config
++    tenant_id = ""
++    cfg = load_client_config(session)
++    if cfg:
++        tenant_id = cfg.get("nome", session)
+     mid = str(m.get("id") or "")
+     if not mid:
+         return False
+@@ -537,7 +540,8 @@ def upsert_message(c, m, session, conv_id):
+         body = media.get("filename") or media.get("mimetype") or "[midia]"
+     c.execute(
+         """INSERT INTO messages (id, conversation_id, session, from_me, sender, body,
+-                                 has_media, media_type, timestamp, ack, created_at)
++                                 has_media, media_type, timestamp, ack, created_at, tenant_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET
+              body=excluded.body, ack=excluded.ack, has_media=excluded.has_media,
+@@ -544,6 +548,7 @@ def upsert_message(c, m, session, conv_id):
+             mid, conv_id, session, 1 if m.get("fromMe") else 0,
+             str(m.get("from") or ""), body, 1 if m.get("hasMedia") else 0,
+             media.get("mimetype"), int(m.get("timestamp") or 0),
++            int(m.get("ack") or 0), now_iso(), tenant_id,
+         ),
+     )
+     return True
+@@ -554,7 +559,10 @@ def upsert_message(c, m, session, conv_id):
+ 
+ 
+ def upsert_conversation(c, chat, session):
++    # Get tenant_id from client config
++    tenant_id = ""
++    cfg = load_client_config(session)
++    if cfg:
++        tenant_id = cfg.get("nome", session)
+     cid = str(chat.get("id") or "")
+     if not cid:
+         return None
+@@ -562,7 +570,8 @@ def upsert_conversation(c, chat, session):
+     is_group = 1 if ("@g.us" in cid) else 0
+     row = c.execute("SELECT mode FROM conversations WHERE session=? AND id=?",
+                     (session, cid)).fetchone()
+     mode = row["mode"] if row else "bot"
+     c.execute(
+         """INSERT INTO conversations (session, id, name, is_group, mode, last_message_at,
+                                       last_message_preview, last_message_id, updated_at, tenant_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(session, id) DO UPDATE SET
+              name=COALESCE(excluded.name, conversations.name),
+              last_message_at=COALESCE(excluded.last_message_at, conversations.last_message_at),
+              last_message_preview=COALESCE(excluded.last_message_preview, conversations.last_message_preview),
+              last_message_id=COALESCE(excluded.last_message_id, conversations.last_message_id),
+              updated_at=excluded.updated_at, tenant_id=excluded.tenant_id""",
+         (
+             session, cid, chat.get("name"), is_group, mode,
+             int(last.get("timestamp") or 0) or None,
+             (preview or "")[:500] or None, str(last.get("id") or "") or None, now_iso(),
++            tenant_id,
+         ),
+     )
+     return cid
+@@ -585,6 +596,26 @@ def upsert_conversation(c, chat, session):
+ 
+ 
+ # ---------------------------------------------------------------- Human intent detection
++def detect_human_intent(text: str, triggers: list) -> bool:
++    """Detect if user wants to talk to a human agent."""
++    if not text:
++        return False
++    text_lower = text.lower()
++    for trigger in triggers:
++        if trigger.lower() in text_lower:
++            return True
++    return False
++
++
++# ---------------------------------------------------------------- Dynamic few-shot loader
++def load_fewshot(client_dir: Path) -> list:
++    """Load few-shot examples from client's prompts/fewshot.json"""
++    fewshot_path = client_dir / "prompts" / "fewshot.json"
++    if fewshot_path.exists():
++        try:
++            with open(fewshot_path, "r", encoding="utf-8") as f:
++                data = json.load(f)
++                return data.get("exemplos", [])
++        except Exception:
++            pass
++    return DEFAULT_FEWSHOT
++
++
++DEFAULT_FEWSHOT = [
++    {"role": "user", "content": "Oi, tudo bem?"},
++    {"role": "assistant", "content": "Oi! Tudo ótimo. Em que posso ajudar?"},
++    {"role": "user", "content": "Quanto custa montar um PC?"},
++    {"role": "assistant", "content": "Depende das peças. Me passa seu orçamento e quais jogos quer rodar que te oriento."},
++    {"role": "user", "content": "Tenho Ryzen 7 e RTX 4050"},
++    {"role": "assistant", "content": "Show! Qual Ryzen 7 exatamente (5700X, 5800X3D, 7700X)? A 4050 é desktop 6GB/8GB ou notebook? E o que já tem: placa-mãe, RAM, SSD, fonte, gabinete, cooler?"},
++    {"role": "user", "content": "Quero falar com atendente"},
++    {"role": "assistant", "content": "Entendido. Transferindo para um atendente humano..."},
++]
++
++
+ # ---------------------------------------------------------------- poller
+ STATE = {"last_cycle": None, "last_ok": None, "last_error": None, "cycles": 0,
+          "new_msgs": 0, "notified": 0}
+@@ -875,6 +906,12 @@ def build_system_prompt(session: str) -> str:
+     kb = load_kb(session)
+     cfg = load_client_config(session)
+ 
++    # Load dynamic few-shot from client config
++    fewshot_examples = DEFAULT_FEWSHOT
++    if cfg and cfg.get("_client_dir"):
++        fewshot_examples = load_fewshot(cfg["_client_dir"])
++
+     # Build few-shot string
+     fewshot_str = ""
+     for ex in fewshot_examples:
+@@ -908,6 +945,7 @@ def build_system_prompt(session: str) -> str:
+         # Resposta única, direta. Max 3 frases. Sem saudação genérica.
+         # Se não souber, diga "Não tenho essa info no momento."
+         # Gatilho humano: "atendente", "humano", "pessoa real", "reclamar", "não resolve", "urgente", "falar com atendente", "quero humano", "transferir"
++        # Tenant: {cfg.get("nome", session) if cfg else session}
+     """
+ 
+     return prompt.strip()
+@@ -1000,6 +1038,28 @@ def detect_booking_intent(text: str) -> bool:
+     return any(kw in text.lower() for kw in keywords)
+ 
+ 
++def detect_os_intent(text: str) -> bool:
++    keywords = ["os ", "ordem de serviço", "abrir os", "chamado", "ticket", "manutenção", "reparo", "consertar", "quebrou", "não liga", "não funciona", "defeito", "problema no"]
++    return any(kw in text.lower() for kw in keywords)
++
++
++# ---------------------------------------------------------------- bot processing
++
++
+ # ---------------------------------------------------------------- F3: bot IA (LLM propoe, executor deterministico valida)
++
++
+ def bot_process_conversation(session, cid, source="poller", send=False, advance=True):
+@@ -1185,6 +1245,25 @@ def bot_process_conversation(session, cid, source="poller", send=False, advance=
+     # cooldown check
+     if not _cooldown_ok(c, session, cid):
+         return {"cid": cid, "session": session, "action": "cooldown", "reason": "cooldown ativo"}
+ 
++    # Load client config for tenant-aware processing
++    cfg = load_client_config(session)
++    tenant_id = cfg.get("nome", session) if cfg else session
++
++    # HUMAN INTENT DETECTION - Check BEFORE LLM call
++    handoff_triggers = cfg.get("handoff_triggers", [
++        "atendente", "humano", "pessoa real", "reclamar", "nao resolve",
++        "urgente", "falar com atendente", "quero humano", "transferir"
++    ])
++    if detect_human_intent(inbound_text, handoff_triggers):
++        # Immediate handoff
++        with db() as c:
++            c.execute(
++                "UPDATE conversations SET mode='humano', updated_at=? WHERE session=? AND id=?",
++                (now_iso(), session, cid)
++            )
++        # Notify owner via Telegram with inline buttons
++        if NOTIFY_ENABLED:
++            _notify_handoff(session, cid, tenant_id, inbound_text, cfg)
++        return {"cid": cid, "session": session, "action": "handoff", "reason": "human_intent_detected", "tenant_id": tenant_id}
++
+     # Load KB
+     kb = load_kb(session)
+ 
+@@ -1363,6 +1442,7 @@ def bot_once():
+     # 2) conversas que estao no modo bot e nao sao grupos (ou grupos se permitido)
+     with db() as c:
+         rows = c.execute(
++            "SELECT session, id FROM conversations WHERE mode='bot' AND (is_group=0 OR ?=1)",
+             (1 if BOT_ALLOW_GROUPS else 0,)
+         ).fetchall()
+     for row in rows:
+@@ -1465,6 +1545,7 @@ def _cooldown_ok(c, session, cid):
+     # per-day cap
+     cap = _session_limit(session, "BOT_DAILY_CAP", BOT_DAILY_CAP)
+     row = c.execute(
++        "SELECT bot_replies_count FROM conversations WHERE session=? AND id=? AND tenant_id=?",
+         (session, cid, tenant_id)
+     ).fetchone()
+     if row and (row["bot_replies_count"] or 0) >= cap:
+@@ -1774,6 +1855,7 @@ def api_conversations():
+         if s:
+             rows = c.execute(
+                 """SELECT * FROM conversations WHERE session=?
++                    AND tenant_id IS NOT NULL
+                    ORDER BY COALESCE(last_message_at,0) DESC LIMIT 300""", (s,)).fetchall()
+         else:
+             rows = c.execute(
+@@ -1784,6 +1866,7 @@ def api_conversations():
+                 """SELECT * FROM conversations
+                    ORDER BY COALESCE(last_message_at,0) DESC LIMIT 300"""
+             ).fetchall()
++        # Filter out conversations without tenant_id for multi-tenant safety
++        rows = [r for r in rows if r["tenant_id"]]
+     out = []
+     for r in rows:
+@@ -1802,6 +1885,7 @@ def api_conversation(cid):
+     session, cid = resolve_conv(cid, _req_session())
+     with db() as c:
+         conv = c.execute("SELECT * FROM conversations WHERE session=? AND id=?",
++                         (session, cid)).fetchone()
+         if not conv:
+             return jsonify({"error": "nao encontrada"}), 404
+         msgs = c.execute(
+@@ -1810,6 +1894,7 @@ def api_conversation(cid):
+             "SELECT * FROM messages WHERE conversation_id=? AND session=? "
+             "ORDER BY timestamp ASC LIMIT 500",
+             (cid, session),
++            # Add tenant_id filter if available
+         ).fetchall()
+     return jsonify({
+@@ -1821,6 +1906,7 @@ def api_conversation(cid):
+ 
+ 
+ @app.post("/api/conversations/<path:cid>/mode")
++def api_mode(cid):
+     body = request.get_json(silent=True) or {}
+     mode = body.get("mode")
+     if mode not in ("bot", "humano"):
+@@ -1830,6 +1916,7 @@ def api_mode(cid):
+     session, cid = resolve_conv(cid, body.get("session") or _req_session())
+     with db() as c:
+         c.execute("UPDATE conversations SET mode=?, updated_at=? WHERE session=? AND id=?",
++                  (mode, now_iso(), session, cid))
+     return jsonify({"ok": True, "id": cid, "session": session, "mode": mode})
+ 
+ 
+@@ -1834,6 +1921,7 @@ def api_mode(cid):
+ 
+ 
+ @app.post("/api/conversations/<path:cid>/read")
++def api_read(cid):
+     session, cid = resolve_conv(cid, _req_session())
+     with db() as c:
+         c.execute("UPDATE conversations SET unread=0, updated_at=? WHERE session=? AND id=?",
++                  (now_iso(), session, cid))
+     return jsonify({"ok": True})
+ 
+ 
+@@ -1843,6 +1931,7 @@ def api_read(cid):
+ 
+ 
+ @app.post("/api/conversations/<path:cid>/send")
++def api_send(cid):
+     body = request.get_json(silent=True) or {}
+     text = (body.get("text") or "").strip()
+     if not text:
+@@ -1850,6 +1939,7 @@ def api_send(cid):
+         mid = waha_send_text(session, cid, text)
+     except urllib.error.HTTPError as e:
+         return jsonify({"error": f"WAHA {e.code}", "detail": e.read().decode()[:300]}), 502
+     except Exception as e:
+@@ -1856,6 +1946,7 @@ def api_send(cid):
+         with db() as c:
+             upsert_message(c, {"id": mid, "fromMe": True, "body": text,
+                                "timestamp": int(time.time())}, session, cid)
++            # tenant_id will be picked up by upsert_message from load_client_config
+     return jsonify({"ok": True, "id": mid, "session": session})
+ 
+ 
+@@ -1907,6 +1998,7 @@ def api_slots():
+     days = int(request.args.get("days", BOOKING_DAYS))
+     session = _req_session() or None
+     return jsonify([{"slot": s, "label": slot_label(s)}
++                    for s in free_slots(load_kb(session), session, days=days)])
+ 
+ 
+@@ -1915,6 +2007,7 @@ def api_bookings():
+     session = _req_session()
+     with db() as c:
+         if session:
+             rows = c.execute("SELECT * FROM bookings WHERE session=? ORDER BY slot ASC",
++                             (session,)).fetchall()
+         else:
+             rows = c.execute("SELECT * FROM bookings ORDER BY slot ASC").fetchall()
+     return jsonify([{k: r[k] for k in r.keys()} for r in rows])
+ 
+ 
+@@ -1927,6 +2020,7 @@ def api_bookings():
+ 
+ 
+ @app.post("/api/bookings")
++def api_booking_create():
+     body = request.get_json(silent=True) or {}
+     cid, slot = body.get("conversation_id"), body.get("slot")
+     if not cid or not slot:
+@@ -1933,6 +2027,7 @@ def api_booking_create():
+     session, cid = resolve_conv(cid, body.get("session") or _req_session())
+     if slot not in free_slots(load_kb(session), session, days=BOOKING_DAYS + 1):
+         return jsonify({"error": "horario fora da agenda ou indisponivel"}), 400
+     r = create_booking(session, cid, slot, body.get("service"), body.get("note"))
+@@ -1940,6 +2035,7 @@ def api_booking_create():
+ 
+ 
+ @app.post("/api/bookings/<int:bid>/cancel")
++def api_booking_cancel(bid):
+     with db() as c:
+         c.execute("UPDATE bookings SET status='cancelado', updated_at=? WHERE id=?", (now_iso(), bid))
+     return jsonify({"ok": True})
+ 
+ 
+@@ -1964,6 +2060,13 @@ def webhook(token):
+     ev = request.get_json(silent=True) or {}
+     session = ev.get("session") or (SESSIONS[0] if SESSIONS else "")
+     kind = ev.get("event", "unknown")
+     notify = None
++    # DEDUP: Check if message already processed
++    with db() as c:
++        p = ev.get("payload") or {}
++        if kind in ("message", "message.any"):
++            msg_id = str(p.get("id") or "")
++            if msg_id and message_exists(c, msg_id):
++                return jsonify({"ok": True, "dedup": True})
+     with db() as c:
+         c.execute("INSERT INTO events (received_at, event, session, payload) VALUES (?,?,?,?)",
+                   (now_iso(), kind, session, json.dumps(ev)[:200000]))
+@@ -1995,6 +2098,54 @@ def webhook(token):
+     return jsonify({"ok": True})
+ 
+ 
++# ---------------------------------------------------------------- Handoff notification
++def _notify_handoff(session, cid, tenant_id, trigger_text, cfg):
++    """Send Telegram notification with inline buttons for handoff."""
++    if not TG_BOT_TOKEN or not TG_CHAT:
++        return
++    try:
++        display = cfg.get("display", session)
++        owner_name = cfg.get("owner_name", "Dono")
++        text = (
++            f"🔁 <b>Handoff solicitado</b>\n"
++            f"Cliente: <b>{display}</b> ({tenant_id})\n"
++            f"Contato: <code>{cid}</code>\n"
++            f"Gatilho: <i>{trigger_text[:100]}</i>\n\n"
++            f"Escolha uma ação:"
++        )
++        keyboard = {
++            "inline_keyboard": [[
++                {"text": "✓ Assumir", "callback_data": f"handoff_assume:{session}:{cid}"},
++                {"text": "✕ Devolver", "callback_data": f"handoff_return:{session}:{cid}"}
++            ]]
++        }
++        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
++        data = {
++            "chat_id": TG_CHAT,
++            "text": text,
++            "parse_mode": "HTML",
++            "reply_markup": json.dumps(keyboard)
++        }
++        req = urllib.request.Request(url, data=json.dumps(data).encode(), headers={"Content-Type": "application/json"})
++        urllib.request.urlopen(req, timeout=10)
++    except Exception as e:
++        STATE["last_error"] = f"_notify_handoff: {type(e).__name__}: {e}"
++
++
++# ---------------------------------------------------------------- SSE endpoint for LabPulse
++from flask import Response
++import queue
++
++# Global event queues per session for SSE
++SSE_QUEUES = {}
++
++def sse_push(session, event_type, data):
++    """Push event to SSE queue for a session."""
++    if session not in SSE_QUEUES:
++        SSE_QUEUES[session] = queue.Queue(maxsize=100)
++    try:
++        SSE_QUEUES[session].put_nowait({"type": event_type, "data": data})
++    except queue.Full:
++        pass  # Drop oldest if full
++
++
++@app.get("/api/events/stream")
++def api_events_stream():
++    """Server-Sent Events endpoint for LabPulse real-time updates."""
++    session = _req_session() or (SESSIONS[0] if SESSIONS else "")
++    if not session:
++        return jsonify({"error": "session required"}), 400
++    if session not in SSE_QUEUES:
++        SSE_QUEUES[session] = queue.Queue(maxsize=100)
++    q = SSE_QUEUES[session]
++
++    def event_stream():
++        yield f"data: {json.dumps({'type': 'connected', 'session': session})}\n\n"
++        while True:
++            try:
++                event = q.get(timeout=30)
++                yield f"data: {json.dumps(event)}\n\n"
++            except queue.Empty:
++                yield ": keepalive\n\n"
++            except GeneratorExit:
++                break
++
++    return Response(event_stream(), mimetype="text/event-stream",
++                    headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
++
++
++# ---------------------------------------------------------------- Bot event emission
++def _emit_bot_event(session, event_type, cid, extra=None):
++    """Emit bot events for SSE."""
++    data = {"session": session, "cid": cid, "timestamp": now_iso()}
++    if extra:
++        data.update(extra)
++    sse_push(session, event_type, data)
++
++
+ if __name__ == "__main__":
+     init_db()
+     threading.Thread(target=poller_loop, daemon=True).start()
+     threading.Thread(target=bot_loop, daemon=True).start()
+     print(json.dumps({"t": now_iso(), "start": "idt-atendimento", "port": PORT,
+                       "sessions": SESSIONS, "db": str(DB_PATH), "kb": KB_PATH or None,
+                       "bot_mode": BOT_MODE, "allowlist": sorted(BOT_ALLOWLIST)}), flush=True)
+     app.run(host=BIND, port=PORT, threaded=True)
