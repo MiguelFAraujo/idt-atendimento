@@ -174,7 +174,16 @@ BOT_ALLOWLIST = {x.strip() for x in os.getenv("ATEND_BOT_ALLOWLIST", "").split("
 
 
 def session_label(session):
-    return SESSION_LABELS.get(session, session)
+    if session in SESSION_LABELS:
+        return SESSION_LABELS[session]
+    cfg = load_client_config(session)
+    if cfg and cfg.get("display"):
+        return cfg["display"]
+    if session == "idt-lab-wpp":
+        return "Miguel · IDT Lab"
+    if session == "cli-002-sebastiancom":
+        return "SebastianCom Informática"
+    return session
 
 
 def kb_path_for(session):
@@ -186,6 +195,18 @@ def kb_path_for(session):
 
 def bot_allowed(session, cid):
     """Allowlist aceita 'cid' (qualquer sessao), 'session:cid' (so aquela) ou '*' (todos)."""
+    try:
+        with db() as c:
+            row = c.execute("SELECT v FROM settings WHERE k='bot_allow_all'").fetchone()
+            if row and row["v"] == "1":
+                return True
+    except Exception:
+        pass
+    cfg = load_client_config(session)
+    if cfg and cfg.get("allowlist"):
+        c_allow = cfg.get("allowlist")
+        if "*" in c_allow or cid in c_allow:
+            return True
     if not BOT_ALLOWLIST:
         return False
     if "*" in BOT_ALLOWLIST:
@@ -639,9 +660,7 @@ def upsert_message(c, m, session, conv_id):
         tenant_id = cfg.get("nome", session)
     mid = str(m.get("id") or "")
     if not mid:
-        print(json.dumps({"t": now_iso(), "upsert_message": "no_mid", "m": m}), flush=True)
         return False
-    print(json.dumps({"t": now_iso(), "upsert_message": "inserting", "mid": mid, "conv_id": conv_id, "session": session, "tenant_id": tenant_id}), flush=True)
     media = m.get("media") or {}
     body = m.get("body")
     if body is None and media:
@@ -856,18 +875,24 @@ def poll_once():
             if not isinstance(chats, list):
                 continue
             for chat in chats:
-                cid = upsert_conversation(c, chat, session)
+                cid = str(chat.get("id") or "")
                 if not cid:
                     continue
                 last_id = str((chat.get("lastMessage") or {}).get("id") or "")
+                unread_count = int(chat.get("unreadCount") or 0)
                 prev = c.execute(
-                    "SELECT last_message_id FROM conversations WHERE session=? AND id=?",
+                    "SELECT last_message_id, unread FROM conversations WHERE session=? AND id=?",
                     (session, cid),
                 ).fetchone()
-                # busca mensagens quando ha novidade ou conversa nova
+                
+                # Atualiza registro de conversa no banco
+                upsert_conversation(c, chat, session)
+                
+                # Busca mensagens completas se houver novidade, nova conversa ou mensagens não lidas
                 needs = True and not warmup
                 if prev and prev["last_message_id"] and last_id:
-                    needs = (not warmup) and not message_exists(c, last_id)
+                    if message_exists(c, last_id) and unread_count == 0:
+                        needs = False
                 if needs:
                     try:
                         msgs = waha("GET", f"/api/{session}/chats/{cid}/messages?limit={msg_limit}&downloadMedia=false", timeout=waha_timeout)
@@ -897,9 +922,8 @@ def poll_once():
                                         body = "[midia]"
                                     d["last"] = body or ""
                 else:
-                    if not warmup:
-                        # ainda assim guarda a ultima mensagem do overview (barata)
-                        upsert_message(c, chat.get("lastMessage") or {}, session, cid)
+                    if not warmup and chat.get("lastMessage"):
+                        upsert_message(c, chat.get("lastMessage"), session, cid)
             c.execute("INSERT INTO settings (k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                       (f"cursor:{session}", now_iso()))
         for (session, cid), d in inbound.items():
@@ -2235,11 +2259,25 @@ def api_conversations():
 @app.get("/api/conversations/<path:cid>")
 def api_conversation(cid):
     session, cid = resolve_conv(cid, _req_session())
+    # Sincroniza em tempo real com o WAHA para espelhamento fiel e imediato
+    sync_waha = request.args.get("sync", "1") == "1"
+    if sync_waha:
+        try:
+            waha_timeout = int(os.getenv(f"WAHA_TIMEOUT_{session.upper().replace('-', '_')}", "5"))
+            msgs = waha("GET", f"/api/{session}/chats/{cid}/messages?limit=50&downloadMedia=false", timeout=min(waha_timeout, 6))
+            if isinstance(msgs, list) and msgs:
+                with db() as c:
+                    for m in msgs:
+                        upsert_message(c, m, session, cid)
+        except Exception:
+            pass
     with db() as c:
         conv = c.execute("SELECT * FROM conversations WHERE session=? AND id=?",
                          (session, cid)).fetchone()
         if not conv:
             return jsonify({"error": "nao encontrada"}), 404
+        c.execute("UPDATE conversations SET unread=0, updated_at=? WHERE session=? AND id=?",
+                  (now_iso(), session, cid))
         msgs = c.execute(
             "SELECT * FROM messages WHERE conversation_id=? AND session=? "
             "ORDER BY timestamp ASC LIMIT 500",
@@ -2249,6 +2287,52 @@ def api_conversation(cid):
         "conversation": {k: conv[k] for k in conv.keys()},
         "messages": [{k: m[k] for k in m.keys()} for m in msgs],
     })
+
+
+@app.get("/api/media/<session>/<path:mid>")
+def api_media_get(session, mid):
+    """Serve mídias (áudios, imagens, documentos) diretamente do WAHA."""
+    with db() as c:
+        m = c.execute("SELECT media_type, body FROM messages WHERE id=? AND session=?", (mid, session)).fetchone()
+    content_type = "application/octet-stream"
+    if m and m["media_type"]:
+        content_type = m["media_type"]
+    elif m and m["body"] and m["body"].endswith(".jpg"):
+        content_type = "image/jpeg"
+    elif m and m["body"] and m["body"].endswith(".ogg"):
+        content_type = "audio/ogg"
+    
+    data = waha_download_media(session, mid)
+    if not data:
+        return jsonify({"error": "midia nao encontrada"}), 404
+    from flask import Response
+    return Response(data, mimetype=content_type)
+
+
+@app.post("/api/conversations/start")
+def api_conversation_start():
+    """Inicia atendimento / conversa diretamente com qualquer número de WhatsApp."""
+    body = request.get_json(silent=True) or {}
+    phone = (body.get("phone") or "").strip()
+    text = (body.get("text") or "").strip()
+    session = body.get("session") or (SESSIONS[0] if SESSIONS else "")
+    if not phone:
+        return jsonify({"error": "Telefone obrigatório"}), 400
+    clean_phone = re.sub(r"\D", "", phone)
+    if not clean_phone.startswith("55") and len(clean_phone) in (10, 11):
+        clean_phone = "55" + clean_phone
+    cid = f"{clean_phone}@c.us"
+    mid = None
+    if text:
+        try:
+            mid = waha_send_text(session, cid, text)
+        except Exception as e:
+            return jsonify({"error": f"Erro no envio WhatsApp: {e}"}), 502
+    with db() as c:
+        upsert_conversation(c, {"id": cid, "name": body.get("name") or clean_phone}, session)
+        if mid and text:
+            upsert_message(c, {"id": mid, "fromMe": True, "body": text, "timestamp": int(time.time())}, session, cid)
+    return jsonify({"ok": True, "cid": cid, "session": session, "id": mid})
 
 
 @app.post("/api/conversations/<path:cid>/mode")
@@ -2303,6 +2387,7 @@ def api_bot_settings():
         "env_mode": BOT_MODE,
         "effective_mode": _bot_effective_mode(),
         "enabled": rows.get("bot_enabled", "1") != "0",
+        "allow_all": rows.get("bot_allow_all", "1") == "1",
         "model": OMNI_MODEL,
         "fallback": OMNI_FALLBACK,
         "allowlist": sorted(BOT_ALLOWLIST),
@@ -2328,6 +2413,10 @@ def api_bot_settings_set():
         if body.get("mode") in ("off", "dry", "live"):
             c.execute("INSERT INTO settings(k,v) VALUES('bot_mode',?) "
                       "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (body["mode"],))
+        if "allow_all" in body:
+            c.execute("INSERT INTO settings(k,v) VALUES('bot_allow_all',?) "
+                      "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                      ("1" if body["allow_all"] else "0",))
     return jsonify({"ok": True, "effective_mode": _bot_effective_mode()})
 
 
@@ -2470,6 +2559,204 @@ def api_client_create():
     return jsonify({"ok": True, "slug": slug, "config": cfg, "kb": kb})
 
 
+@app.get("/api/waha/sessions")
+def api_waha_sessions():
+    """Retorna todas as sessões do WAHA, status de conexão e se já estão integradas como cliente."""
+    try:
+        raw_sessions = waha("GET", "/api/sessions", timeout=10)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "sessions": []})
+    
+    if not isinstance(raw_sessions, list):
+        return jsonify({"ok": False, "error": "Resposta inválida do WAHA", "sessions": []})
+    
+    # Get registered clients
+    clients = []
+    if CLIENTS_DIR.exists():
+        for cdir in CLIENTS_DIR.iterdir():
+            if cdir.is_dir() and (cdir / "config.json").exists():
+                try:
+                    with open(cdir / "config.json", "r", encoding="utf-8") as f:
+                        cfg = json.load(f)
+                    clients.append(cfg)
+                except Exception:
+                    pass
+    
+    result = []
+    for s in raw_sessions:
+        name = s.get("name") or ""
+        status = s.get("status") or "UNKNOWN"
+        me = s.get("me") or {}
+        phone = me.get("id", "").replace("@c.us", "") if me else ""
+        push_name = me.get("pushName") or name
+        
+        # Check if integrated as client
+        matched_client = next((c for c in clients if c.get("instance") == name or c.get("nome") == name or c.get("slug") == name), None)
+        is_integrated = matched_client is not None
+        
+        result.append({
+            "name": name,
+            "status": status,
+            "is_working": status == "WORKING",
+            "phone": phone,
+            "push_name": push_name,
+            "is_integrated": is_integrated,
+            "client_slug": matched_client.get("nome") if matched_client else None,
+            "client_display": matched_client.get("display") if matched_client else None,
+            "in_atend_sessions": name in SESSIONS
+        })
+    return jsonify({"ok": True, "sessions": result})
+
+
+@app.post("/api/waha/sessions/integrate")
+def api_waha_sessions_integrate():
+    """Integra uma sessão ativa do WAHA como cliente no sistema com 1 clique."""
+    import re
+    body = request.get_json(silent=True) or {}
+    session_name = (body.get("session") or "").strip()
+    if not session_name:
+        return jsonify({"error": "Nome da sessão obrigatório"}), 400
+    
+    # Consulta sessão no WAHA
+    try:
+        waha_session = waha("GET", f"/api/sessions/{session_name}", timeout=10)
+    except Exception as e:
+        waha_session = {}
+    
+    me = (waha_session or {}).get("me") or {}
+    phone = me.get("id", "").replace("@c.us", "") if me else (body.get("phone") or "").strip()
+    push_name = me.get("pushName") or body.get("display") or session_name
+    slug = body.get("slug") or re.sub(r"[^a-zA-Z0-9_-]", "-", session_name.lower()).strip("-")
+    
+    client_dir = CLIENTS_DIR / slug
+    client_dir.mkdir(parents=True, exist_ok=True)
+    
+    display = body.get("display") or push_name or session_name
+    cfg = {
+        "nome": slug,
+        "slug": slug,
+        "display": display,
+        "instance": session_name,
+        "owner_number": phone,
+        "owner_name": push_name,
+        "knowledge_base": str(client_dir / "kb.json"),
+        "model": "auto/best-chat",
+        "enabled": True,
+        "allowlist": ["*"]
+    }
+    with open(client_dir / "config.json", "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    
+    kb_path = client_dir / "kb.json"
+    if not kb_path.exists():
+        initial_kb = {
+            "negocio": {
+                "nome": display,
+                "whatsapp": phone,
+                "descricao": f"Atendimento automatizado e suporte {display}"
+            },
+            "horarios": {
+                "segunda_a_sexta": "08:00 - 18:00",
+                "sabado": "08:00 - 12:00",
+                "domingo": "fechado"
+            },
+            "servicos": [
+                {"nome": "Atendimento Geral", "preco": "Sob Consulta", "categoria": "Suporte", "descricao": "Tire dúvidas e solicite suporte técnico"}
+            ],
+            "faq": [
+                {"pergunta": "Qual o horário de atendimento?", "resposta": "Atendemos de segunda a sexta das 08h às 18h e aos sábados das 08h às 12h."},
+                {"pergunta": "Como falar com um atendente humano?", "resposta": "Basta digitar 'humano' ou 'atendente' para transferir."}
+            ]
+        }
+        with open(kb_path, "w", encoding="utf-8") as f:
+            json.dump(initial_kb, f, ensure_ascii=False, indent=2)
+    
+    if session_name not in SESSIONS:
+        SESSIONS.append(session_name)
+    
+    # Atualiza .env para persistir sessão
+    env_file = Path("/home/miguel/.config/idt-atendimento/env")
+    if env_file.exists():
+        try:
+            content = env_file.read_text(encoding="utf-8")
+            match = re.search(r"^ATEND_SESSIONS=(.*)$", content, re.M)
+            if match:
+                current_sessions = [s.strip() for s in match.group(1).split(",") if s.strip()]
+                if session_name not in current_sessions:
+                    current_sessions.append(session_name)
+                    new_val = ",".join(current_sessions)
+                    content = re.sub(r"^ATEND_SESSIONS=.*$", f"ATEND_SESSIONS={new_val}", content, flags=re.M)
+                    env_file.write_text(content, encoding="utf-8")
+        except Exception:
+            pass
+
+    return jsonify({"ok": True, "slug": slug, "client": cfg})
+
+
+CURRENT_APP_VERSION = "2.2.0"
+CURRENT_VERSION_CODE = 3
+STATIC_DIR = Path(__file__).parent / "static"
+
+@app.get("/api/app/version")
+def api_app_version():
+    """Retorna versão do app e informações de atualização automática."""
+    apk_file = STATIC_DIR / "InteligenciaDoTopo.apk"
+    apk_size = apk_file.stat().st_size if apk_file.exists() else 0
+    apk_mtime = datetime.fromtimestamp(apk_file.stat().st_mtime, timezone.utc).isoformat() if apk_file.exists() else None
+    
+    client_ver = request.args.get("v") or ""
+    client_code = int(request.args.get("code") or 0)
+    has_update = False
+    if client_code > 0:
+        has_update = client_code < CURRENT_VERSION_CODE
+    elif client_ver:
+        has_update = client_ver != CURRENT_APP_VERSION
+        
+    return jsonify({
+        "version": CURRENT_APP_VERSION,
+        "version_code": CURRENT_VERSION_CODE,
+        "has_update": has_update,
+        "apk_url": "/static/InteligenciaDoTopo.apk",
+        "apk_size": apk_size,
+        "updated_at": apk_mtime,
+        "release_notes": "Versão 2.2.0: Identidade Inteligência do Topo, auto-updater, espelhamento WAHA em tempo real, suporte completo a áudio/mídia, integração de sessões ativas e Map-OS."
+    })
+
+
+@app.get("/api/bot/os")
+def api_bot_os_list():
+    """Lista ordens de serviço do Map-OS."""
+    if not _authorized():
+        return jsonify({"error": "nao autorizado"}), 403
+    try:
+        limit = int(request.args.get("limit", 30))
+        status = request.args.get("status")
+        os_list = MAPOS.list_os(status=status, limit=limit)
+        return jsonify({"ok": True, "os": os_list})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "os": []})
+
+
+@app.post("/api/bookings/create-manual")
+def api_booking_create_manual():
+    """Cria agendamento manual diretamente pelo app."""
+    body = request.get_json(silent=True) or {}
+    slot = body.get("slot")
+    session = body.get("session") or (SESSIONS[0] if SESSIONS else "")
+    name = body.get("name") or "Cliente Balcão"
+    phone = body.get("phone") or ""
+    service = body.get("service")
+    note = body.get("note")
+    if not slot:
+        return jsonify({"error": "Horario/slot obrigatorio"}), 400
+    cid = f"{re.sub(r'[^0-9]', '', phone)}@c.us" if phone else f"balcao-{int(time.time())}@c.us"
+    res = create_booking(session, cid, slot, service=service, note=note)
+    if res.get("ok"):
+        with db() as c:
+            c.execute("UPDATE bookings SET name=?, phone=? WHERE id=?", (name, phone, res.get("id")))
+    return jsonify(res)
+
+
 @app.get("/api/kb")
 def api_kb():
     session = _req_session() or (SESSIONS[0] if SESSIONS else "")
@@ -2587,8 +2874,7 @@ def webhook(token):
                 print(json.dumps({"t": now_iso(), "webhook": "processing", "msg_id": msg_id, "session": session, "cid": cid}), flush=True)
                 existed = message_exists(c, msg_id)
                 if existed:
-                    print(json.dumps({"t": now_iso(), "webhook": "duplicate_skipped", "msg_id": msg_id, "session": session, "cid": cid}), flush=True)
-                    return jsonify({"ok": True, "duplicate": True})
+                    continue
                 upsert_conversation(c, {"id": cid, "lastMessage": msg}, session)
                 upsert_message(c, msg, session, cid)
                 if (not existed) and (not msg.get("fromMe")):
