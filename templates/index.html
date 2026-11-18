@@ -11,24 +11,26 @@
   <title>Inteligência do Topo · Atendimento & Robôs WhatsApp</title>
   <style>
   :root {
-    --bg: #090D16;
-    --surface: #111827;
-    --card: #161F30;
-    --card-elevated: #1E293B;
-    --line: #233044;
-    --line-subtle: #1a2333;
-    --txt: #F8FAFC;
-    --dim: #94A3B8;
-    --muted: #64748B;
-    --primary: #00E5FF;
-    --primary-hover: #00B0FF;
-    --primary-glow: rgba(0, 229, 255, 0.25);
-    --secondary: #10B981;
-    --secondary-hover: #059669;
+    --bg: #0B141A;
+    --surface: #111B21;
+    --header: #202C33;
+    --card: #111B21;
+    --card-elevated: #202C33;
+    --line: #222D34;
+    --line-subtle: #182229;
+    --txt: #E9EDEF;
+    --dim: #8696A0;
+    --muted: #667781;
+    --primary: #00A884;
+    --primary-hover: #02906F;
+    --primary-glow: rgba(0, 168, 132, 0.25);
+    --secondary: #25D366;
+    --secondary-hover: #1EBE5D;
     --warn: #F59E0B;
     --danger: #EF4444;
-    --out: #0A3347;
-    --in: #1E293B;
+    --out: #005C4B;
+    --in: #202C33;
+    --check-read: #53BDEB;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; padding: 0; }
@@ -289,37 +291,37 @@
     overflow-y: auto;
   }
   .conv {
-    padding: 12px 14px;
+    padding: 10px 14px;
     display: flex;
     align-items: center;
     gap: 12px;
     border-bottom: 1px solid var(--line-subtle);
     cursor: pointer;
-    transition: background 0.15s ease;
+    transition: background 0.12s ease;
   }
   .conv:hover {
-    background: rgba(255, 255, 255, 0.03);
+    background: #202C33;
   }
   .conv.active {
-    background: var(--card);
-    border-left: 3px solid var(--primary);
+    background: #2A3942;
+    border-left: 4px solid var(--primary);
   }
   .conv.unread {
-    background: rgba(0, 229, 255, 0.04);
+    background: rgba(37, 211, 102, 0.05);
   }
   .ava {
-    width: 44px;
-    height: 44px;
+    width: 46px;
+    height: 46px;
     border-radius: 50%;
-    background: var(--card-elevated);
-    border: 1px solid var(--line);
+    background: #2A3942;
     display: flex;
     align-items: center;
     justify-content: center;
     font-weight: 700;
-    color: var(--primary);
+    color: #fff;
     flex-shrink: 0;
-    font-size: 15px;
+    font-size: 16px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.3);
   }
   .cmeta {
     flex: 1 1 auto;
@@ -328,40 +330,65 @@
   .crow {
     display: flex;
     justify-content: space-between;
-    align-items: center;
+    align-items: baseline;
     gap: 6px;
   }
   .cname {
     font-weight: 600;
-    color: #fff;
-    font-size: 14px;
+    color: var(--txt);
+    font-size: 15px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .ctime {
+  .cphone {
     font-size: 11px;
-    color: var(--muted);
+    color: var(--dim);
+    margin-left: 6px;
+    font-weight: normal;
+  }
+  .ctime {
+    font-size: 11.5px;
+    color: var(--dim);
     flex-shrink: 0;
   }
   .csub {
-    margin-top: 4px;
+    margin-top: 3px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
   }
   .cprev {
-    font-size: 12px;
+    font-size: 13px;
     color: var(--dim);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    max-width: 220px;
   }
   .badge {
-    background: var(--primary);
-    color: #090D16;
+    background: #25D366;
+    color: #111B21;
     font-size: 11px;
     font-weight: 800;
-    border-radius: 10px;
-    padding: 2px 7px;
+    border-radius: 12px;
+    min-width: 19px;
+    height: 19px;
+    padding: 0 5px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     flex-shrink: 0;
+  }
+  .msg-check {
+    color: var(--check-read);
+    font-size: 12px;
+    font-weight: bold;
+    display: inline-block;
   }
 
   /* Tags */
@@ -399,7 +426,7 @@
     background: var(--bg);
   }
   #chat-header {
-    background: var(--surface);
+    background: var(--header);
     padding: 10px 16px;
     border-bottom: 1px solid var(--line);
     display: flex;
@@ -410,16 +437,16 @@
   .chat-contact-info {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 12px;
   }
   #tname {
-    font-size: 15px;
-    font-weight: 700;
-    color: #fff;
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--txt);
     margin: 0;
   }
   #tsess {
-    font-size: 11px;
+    font-size: 12px;
     color: var(--dim);
   }
   #chat-actions {
@@ -427,15 +454,40 @@
     align-items: center;
     gap: 8px;
   }
+  .btn-mode-toggle {
+    border: none;
+    padding: 7px 14px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 700;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    transition: all 0.2s ease;
+  }
+  .btn-mode-toggle.is-bot {
+    background: #00A884;
+    color: #111B21;
+    box-shadow: 0 0 10px rgba(0, 168, 132, 0.35);
+  }
+  .btn-mode-toggle.is-human {
+    background: #2A3942;
+    color: #F59E0B;
+    border: 1px solid rgba(245, 158, 11, 0.35);
+  }
 
   /* Messages Box */
   #msgs {
     flex: 1 1 auto;
     overflow-y: auto;
-    padding: 16px 20px;
+    padding: 16px 24px;
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 6px;
+    background-color: #0B141A;
+    background-image: radial-gradient(circle at 50% 50%, rgba(32, 44, 51, 0.45) 1.5px, transparent 1.5px);
+    background-size: 24px 24px;
   }
   .empty-chat {
     display: flex;
@@ -443,42 +495,44 @@
     align-items: center;
     justify-content: center;
     height: 100%;
-    color: var(--muted);
+    color: var(--dim);
     gap: 8px;
+    text-align: center;
   }
   .msg {
-    max-width: 72%;
-    padding: 10px 14px;
-    border-radius: 12px;
-    font-size: 13.5px;
-    line-height: 1.45;
+    max-width: 68%;
+    padding: 7px 11px 6px 12px;
+    border-radius: 7.5px;
+    font-size: 14.2px;
+    line-height: 1.42;
     position: relative;
     word-break: break-word;
+    box-shadow: 0 1px 0.5px rgba(11,20,26,.15);
   }
   .msg.out {
     align-self: flex-end;
-    background: var(--out);
-    color: #fff;
-    border-bottom-right-radius: 3px;
-    border: 1px solid rgba(0, 229, 255, 0.15);
+    background: #005C4B;
+    color: #E9EDEF;
+    border-top-right-radius: 1px;
   }
   .msg.in {
     align-self: flex-start;
-    background: var(--in);
-    color: var(--txt);
-    border-bottom-left-radius: 3px;
-    border: 1px solid var(--line);
+    background: #202C33;
+    color: #E9EDEF;
+    border-top-left-radius: 1px;
   }
   .msg .t {
-    display: block;
-    font-size: 10.5px;
-    color: var(--dim);
-    text-align: right;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    font-size: 11px;
+    color: rgba(233, 237, 239, 0.6);
+    float: right;
+    margin-left: 10px;
     margin-top: 4px;
   }
   .msg.out .t {
-    color: var(--primary);
-    opacity: 0.8;
+    color: rgba(233, 237, 239, 0.65);
   }
 
   /* Media rendering in messages */
@@ -516,8 +570,8 @@
 
   /* Composer */
   #composer {
-    background: var(--surface);
-    padding: 12px 16px;
+    background: #202C33;
+    padding: 8px 14px;
     border-top: 1px solid var(--line);
     display: flex;
     align-items: center;
@@ -525,21 +579,38 @@
   }
   #txt {
     flex: 1 1 auto;
-    background: var(--card);
-    border: 1px solid var(--line);
-    border-radius: 10px;
+    background: #2A3942;
+    border: none;
+    border-radius: 8px;
     padding: 10px 14px;
-    color: #fff;
-    font-size: 14px;
+    color: #E9EDEF;
+    font-size: 14.5px;
     outline: none;
-    transition: border 0.2s;
   }
-  #txt:focus {
-    border-color: var(--primary);
+  #txt::placeholder {
+    color: #8696A0;
   }
   #btn-send {
-    background: var(--primary);
-    color: #090D16;
+    background: #00A884;
+    color: #111B21;
+    border: none;
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    transition: background 0.2s, transform 0.1s;
+    flex-shrink: 0;
+  }
+  #btn-send:hover {
+    background: #02906F;
+  }
+  #btn-send:active {
+    transform: scale(0.95);
+  }
     border: none;
     padding: 10px 18px;
     border-radius: 10px;
@@ -790,7 +861,7 @@
       </button>
 
       <button class="btn-hdr" onclick="checkAppUpdate(true)">
-        🔄 v2.2.1
+        🔄 v2.2.2
       </button>
 
       <button class="btn-hdr" id="btn-install" title="Instalar Aplicativo">
@@ -814,8 +885,9 @@
           <div class="filter-chips">
             <span class="f-chip active" onclick="setFilter('all', this)">Todas</span>
             <span class="f-chip" onclick="setFilter('unread', this)">Não Lidas</span>
-            <span class="f-chip" onclick="setFilter('bot', this)">No Robô</span>
-            <span class="f-chip" onclick="setFilter('human', this)">No Humano</span>
+            <span class="f-chip" onclick="setFilter('bot', this)">🤖 Robô</span>
+            <span class="f-chip" onclick="setFilter('human', this)">👤 Humano</span>
+            <span class="f-chip" onclick="syncAllContacts(this)" title="Sincronizar nomes de contatos e grupos com o WhatsApp">🔄 Nomes</span>
           </div>
         </div>
 
@@ -838,10 +910,10 @@
           </div>
           <div id="chat-actions">
             <!-- Mode badge toggle -->
-            <button class="btn-hdr" id="btn-toggle-mode" onclick="toggleCurrentMode()">
-              🤖 Modo Robô
+            <button class="btn-mode-toggle is-bot" id="btn-toggle-mode" onclick="toggleCurrentMode()">
+              🤖 Robô Ativo
             </button>
-            <button class="btn-hdr" onclick="syncCurrentChat()" title="Sincronizar histórico do WhatsApp">
+            <button class="btn-hdr" onclick="syncCurrentChat()" title="Sincronizar mensagens do WhatsApp">
               🔄 Sincronizar
             </button>
             <button class="btn-hdr" onclick="openNewOsModalForChat()" title="Criar OS no Map-OS">
@@ -852,17 +924,16 @@
 
         <div id="msgs">
           <div class="empty-chat">
-            <div style="font-size:36px;margin-bottom:8px">💬</div>
-            <p style="font-weight:600">Selecione uma conversa ao lado para iniciar</p>
-            <p style="font-size:12px;color:var(--muted)">Todas as mensagens são espelhadas em tempo real com o WhatsApp</p>
+            <div style="font-size:42px;margin-bottom:8px">💬</div>
+            <p style="font-weight:600;font-size:16px;color:var(--txt)">Selecione uma conversa para iniciar o atendimento</p>
+            <p style="font-size:13px;color:var(--dim)">Espelhamento fiel, seguro e em tempo real com o WhatsApp</p>
           </div>
         </div>
 
         <div id="composer" style="display:none">
-          <input type="text" id="txt" placeholder="Digite uma mensagem... (Enter para enviar)">
-          <button id="btn-send" onclick="sendMsg()">
-            <span>Enviar</span>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+          <input type="text" id="txt" placeholder="Mensagem (Enter para enviar)">
+          <button id="btn-send" onclick="sendMsg()" title="Enviar">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
           </button>
         </div>
       </section>
@@ -910,13 +981,15 @@
           </div>
         </div>
 
-        <div class="card">
-          <h2>Configuração de Segurança & Permissões</h2>
-          <p style="color:var(--dim);font-size:13px;margin:0 0 14px">Defina se o robô responde a qualquer cliente ou apenas a números de teste.</p>
-          <div style="display:flex;gap:10px">
-            <button class="b-sec" id="btn-allow-all" onclick="setBotAllow(true)">🔓 Responder Todos os Clientes (*)</button>
-            <button class="b-sec" id="btn-allow-test" onclick="setBotAllow(false)">🔒 Apenas Números da Lista de Teste</button>
-          </div>
+        <div class="card" style="border:1px solid rgba(0, 168, 132, 0.4);background:rgba(0, 168, 132, 0.06)">
+          <h2 style="color:var(--primary)">🛡️ Modo de Segurança & Disparo Restrito</h2>
+          <p style="color:var(--txt);font-size:13.5px;margin:0 0 10px;line-height:1.5">
+            <b>Disparos de mensagens ao vivo autorizados exclusivamente para o seu número:</b><br>
+            <code style="background:var(--header);padding:3px 8px;border-radius:6px;color:var(--secondary);font-size:14px;font-weight:700;display:inline-block;margin-top:6px">+55 (21) 98874-3980</code>
+          </p>
+          <p style="color:var(--dim);font-size:12px;margin:0;line-height:1.5">
+            🔒 <b>Garantia de isolamento total:</b> Nenhum outro cliente ou número externo recebe mensagens. Todos os outros contatos são bloqueados pelo guardrail de segurança.
+          </p>
         </div>
       </div>
     </div>
@@ -1110,6 +1183,16 @@
     t.innerHTML = msg;
     t.style.display = 'flex';
     setTimeout(() => { t.style.display = 'none'; }, duration);
+  }
+
+  const AVATAR_COLORS = [
+    '#00A884', '#008069', '#128C7E', '#34B7F1', '#25D366',
+    '#F59E0B', '#EC4899', '#8B5CF6', '#3B82F6', '#10B981'
+  ];
+  function getAvatarColor(str) {
+    let hash = 0;
+    for (let i = 0; i < (str || '').length; i++) hash = str.charCodeAt(i) + ((hash << 5) - hash);
+    return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
   }
 
   function formatContactName(rawName, id) {
@@ -1327,20 +1410,22 @@
 
       const displayName = formatContactName(c.name, c.id);
       const ini = getAvatarInitial(displayName);
+      const avaColor = getAvatarColor(displayName);
       const badge = c.unread > 0 ? `<span class="badge">${c.unread}</span>` : '';
-      const tagMode = c.mode === 'humano' ? '<span class="tag hum">Humano</span>' : '<span class="tag bot">Robô</span>';
+      const tagMode = c.mode === 'humano' ? '<span class="tag hum">👤 Humano</span>' : '<span class="tag bot">🤖 Robô</span>';
       const tagSess = `<span class="tag sess">${esc(c.label || c.session)}</span>`;
+      const phoneSub = c.phone && c.phone !== displayName ? `<span class="cphone">${esc(c.phone)}</span>` : '';
 
       el.innerHTML = `
-        <div class="ava">${esc(ini)}</div>
+        <div class="ava" style="background:${avaColor}">${esc(ini)}</div>
         <div class="cmeta">
           <div class="crow">
-            <span class="cname">${esc(displayName)}${c.is_group ? ' 👥' : ''}</span>
+            <span class="cname">${esc(displayName)}${c.is_group ? ' 👥' : ''}${phoneSub}</span>
             <span class="ctime">${fmt(c.last_message_at)}</span>
           </div>
-          <div class="crow csub">
+          <div class="csub">
             <div class="cprev">${esc(c.preview || '')}</div>
-            <div style="display:flex;align-items:center;gap:4px">
+            <div style="display:flex;align-items:center;gap:5px">
               ${tagSess}
               ${tagMode}
               ${badge}
@@ -1349,6 +1434,24 @@
         </div>`;
       box.appendChild(el);
     }
+  }
+
+  async function syncAllContacts(el) {
+    if (el) el.textContent = '⏳ Sincronizando...';
+    showToast('🔄 Sincronizando nomes de contatos e grupos com o WhatsApp...');
+    try {
+      const r = await fetch('/api/contacts/sync' + (SESS ? `?s=${SESS}` : ''), { method: 'POST' });
+      if (r.ok) {
+        const data = await r.json();
+        showToast(`✅ ${data.updated} contatos e grupos atualizados com sucesso!`);
+      } else {
+        showToast('⚠️ Erro ao sincronizar contatos com o WAHA.');
+      }
+    } catch (e) {
+      showToast('⚠️ Erro de rede ao sincronizar contatos.');
+    }
+    if (el) el.textContent = '🔄 Nomes';
+    await loadConvs();
   }
 
   async function openConv(c) {
@@ -1360,7 +1463,8 @@
     const displayName = formatContactName(c.name, c.id);
     $('#tname').textContent = displayName;
     $('#tavatar').textContent = getAvatarInitial(displayName);
-    $('#tsess').textContent = `${c.label || c.session} · ${c.id}`;
+    $('#tavatar').style.background = getAvatarColor(displayName);
+    $('#tsess').textContent = `${c.label || c.session}${c.phone ? ' · ' + c.phone : ''}`;
 
     updateChatModeButton(c.mode);
     await loadMsgs(true);
@@ -1369,12 +1473,13 @@
 
   function updateChatModeButton(mode) {
     const btn = $('#btn-toggle-mode');
+    if (!btn) return;
     if (mode === 'humano') {
-      btn.textContent = '👤 No Humano (Clique p/ Robô)';
-      btn.className = 'btn-hdr highlight';
+      btn.innerHTML = '👤 Modo Humano (Clique p/ Ativar Robô)';
+      btn.className = 'btn-mode-toggle is-human';
     } else {
-      btn.textContent = '🤖 No Robô (Clique p/ Assumir)';
-      btn.className = 'btn-hdr';
+      btn.innerHTML = '🤖 Robô Ativo (IA Respondendo)';
+      btn.className = 'btn-mode-toggle is-bot';
     }
   }
 
@@ -1389,7 +1494,7 @@
     CUR.mode = newMode;
     updateChatModeButton(newMode);
     loadConvs();
-    showToast(newMode === 'humano' ? '👤 Você assumiu o atendimento desta conversa.' : '🤖 Conversa devolvida ao Robô.');
+    showToast(newMode === 'humano' ? '👤 Atendimento assumido manualmente.' : '🤖 Robô ativado para responder automaticamente.');
   }
 
   async function syncCurrentChat() {
@@ -1427,10 +1532,11 @@
         }
       }
 
+      const tick = m.from_me ? '<span class="msg-check">✓✓</span>' : '';
       el.innerHTML = `
         ${m.body && !m.body.startsWith('[midia]') ? esc(m.body) : ''}
         ${mediaHtml}
-        <span class="t">${fmt(m.timestamp)}</span>
+        <span class="t">${fmt(m.timestamp)} ${tick}</span>
       `;
       box.appendChild(el);
     }
@@ -1688,7 +1794,7 @@
     const modeLabels = { off: '⏸️ Pausado (Desligado)', dry: '🧪 Simulação (Dry-run)', live: '🟢 Ao Vivo (Respondendo Clientes)' };
     $('#bot-status-mode').textContent = modeLabels[d.effective_mode] || d.effective_mode;
     $('#bot-model').textContent = d.model || 'auto/best-chat';
-    $('#bot-allow-info').textContent = d.allow_all ? '🔓 Aberto a Todos os Contatos (*)' : '🔒 Apenas Lista de Permissões';
+    $('#bot-allow-info').textContent = '🔒 Restrito ao Número do Operador (+55 21 98874-3980)';
 
     $('#btn-mode-off').className = d.effective_mode === 'off' ? 'b-on' : 'b-sec';
     $('#btn-mode-dry').className = d.effective_mode === 'dry' ? 'b-on' : 'b-sec';

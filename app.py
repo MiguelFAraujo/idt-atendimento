@@ -193,10 +193,29 @@ def kb_path_for(session):
     return KB_MAP.get(session) or KB_PATH
 
 
+# ---------------------------------------------------------------- SEGURANÇA ESTRITA DE DISPARO
+ALLOWED_DISPATCH_NUMBERS = {"5521988743980", "21988743980", "5521988743980@c.us"}
+
+def is_dispatch_permitted(chat_id):
+    """Garante que NENHUMA mensagem seja enviada para qualquer número exceto o do operador (21988743980)."""
+    if not chat_id:
+        return False
+    cid_str = str(chat_id).strip()
+    cid_clean = cid_str.split("@")[0].strip()
+    return (cid_clean in ALLOWED_DISPATCH_NUMBERS) or (cid_str in ALLOWED_DISPATCH_NUMBERS)
+
+
 def bot_allowed(session, cid):
     """Allowlist aceita 'cid' (qualquer sessao), 'session:cid' (so aquela) ou '*' (todos)."""
+    # 1. Se for o número autorizado de teste do operador, sempre permitido
+    if is_dispatch_permitted(cid):
+        return True
+    # 2. Se o operador ativou o modo 'bot' especificamente nesta conversa, está autorizada
     try:
         with db() as c:
+            conv = c.execute("SELECT mode FROM conversations WHERE session=? AND id=?", (session, cid)).fetchone()
+            if conv and conv["mode"] == "bot":
+                return True
             row = c.execute("SELECT v FROM settings WHERE k='bot_allow_all'").fetchone()
             if row and row["v"] == "1":
                 return True
@@ -337,6 +356,10 @@ def waha_send_text(session, cid, text):
     O WAHA (engine NOWEB) devolve o id em res['key']['id']; versoes/aliases
     antigos podem devolver res['id'] (str) ou res['id']['id'] (dict). Cobre os 3.
     """
+    if not is_dispatch_permitted(cid):
+        print(json.dumps({"t": now_iso(), "safety_guardrail": "BLOCKED", "blocked_chatId": cid,
+                          "reason": "ENVIO RESTRITO: Apenas o número do operador 21988743980 tem autorização de disparo."}), flush=True)
+        return "BLOCKED_BY_SAFETY_GUARDRAIL"
     # Use per-session timeout for sends too
     waha_timeout = int(os.getenv(f"WAHA_TIMEOUT_{session.upper().replace('-', '_')}", str(WAHA_TIMEOUT)))
     res = waha("POST", "/api/sendText", {"session": session, "chatId": cid, "text": text}, timeout=waha_timeout)
@@ -359,6 +382,10 @@ def waha_send_buttons(session, cid, text, buttons):
     buttons: lista de dicts [{"id": "...", "title": "..."}, ...] (max 3).
     Retorna o message id ou None.
     """
+    if not is_dispatch_permitted(cid):
+        print(json.dumps({"t": now_iso(), "safety_guardrail": "BLOCKED", "blocked_chatId": cid,
+                          "reason": "ENVIO RESTRITO: Apenas o número do operador 21988743980 tem autorização de disparo."}), flush=True)
+        return "BLOCKED_BY_SAFETY_GUARDRAIL"
     waha_timeout = int(os.getenv(f"WAHA_TIMEOUT_{session.upper().replace(chr(45), chr(95))}", str(WAHA_TIMEOUT)))
     waha_buttons = []
     for b in (buttons or [])[:3]:
@@ -391,6 +418,10 @@ def waha_send_list(session, cid, text, title, description, rows):
     rows: lista de dicts [{"id": "...", "title": "...", "description": "..."}, ...].
     Retorna o message id ou None.
     """
+    if not is_dispatch_permitted(cid):
+        print(json.dumps({"t": now_iso(), "safety_guardrail": "BLOCKED", "blocked_chatId": cid,
+                          "reason": "ENVIO RESTRITO: Apenas o número do operador 21988743980 tem autorização de disparo."}), flush=True)
+        return "BLOCKED_BY_SAFETY_GUARDRAIL"
     waha_timeout = int(os.getenv(f"WAHA_TIMEOUT_{session.upper().replace(chr(45), chr(95))}", str(WAHA_TIMEOUT)))
     waha_rows = []
     for r in (rows or [])[:10]:
@@ -933,13 +964,26 @@ def poll_once():
     STATE["new_msgs"] += total_new
     STATE["last_cycle"] = now_iso()
     STATE["last_ok"] = now_iso()
-    if (not warmup) and inbound and NOTIFY_ENABLED:
+    if (not warmup) and inbound:
         for (session, cid), d in inbound.items():
+            # Se a conversa está em modo bot ativo, aciona processamento imediato do robô
             try:
-                if maybe_notify(session, cid, d):
-                    STATE["notified"] += 1
+                with db() as c:
+                    conv_row = c.execute("SELECT mode FROM conversations WHERE session=? AND id=?", (session, cid)).fetchone()
+                if conv_row and conv_row["mode"] == "bot":
+                    eff_mode = _bot_effective_mode()
+                    if eff_mode != "off":
+                        bot_process_conversation(session, cid, eff_mode, send=(eff_mode == "live"), advance=True)
             except Exception as e:
-                STATE["last_error"] = f"notify: {type(e).__name__}: {e}"
+                print(json.dumps({"t": now_iso(), "poller_bot_err": str(e), "cid": cid}), flush=True)
+
+        if NOTIFY_ENABLED:
+            for (session, cid), d in inbound.items():
+                try:
+                    if maybe_notify(session, cid, d):
+                        STATE["notified"] += 1
+                except Exception as e:
+                    STATE["last_error"] = f"notify: {type(e).__name__}: {e}"
     return total_new
 
 
@@ -1489,7 +1533,8 @@ def bot_process_conversation(session, cid, mode, send=True, advance=True):
 
     now = int(time.time())
     msg_age = now - int(last_in["timestamp"] or 0)
-    if msg_age > 180:
+    max_age = int(os.getenv("BOT_MAX_INBOUND_AGE", "900"))
+    if msg_age > max_age:
         if advance:
             with db() as c:
                 c.execute("UPDATE conversations SET bot_last_inbound_id=? WHERE session=? AND id=?",
@@ -1497,6 +1542,9 @@ def bot_process_conversation(session, cid, mode, send=True, advance=True):
         return {"cid": cid, "session": session, "action": "skip", "reason": f"stale_inbound_{msg_age}s"}
 
     if send:
+        # Se for qualquer número que NÃO seja o do operador (21988743980), bloqueia disparo ao vivo
+        if not is_dispatch_permitted(cid):
+            send = False
         effective_mode = _bot_effective_mode()
         if effective_mode == "off":
             return {"cid": cid, "session": session, "action": "skip", "reason": "bot_desligado"}
@@ -1743,9 +1791,6 @@ def bot_once(mode, session=None):
         BOT_STATE["last_error"] = "horario silencioso"
         return 0
     live = (mode == "live")
-    if live and not BOT_ALLOWLIST:
-        BOT_STATE["last_error"] = "live sem allowlist — abortado por seguranca"
-        return 0
     with db() as c:
         convs = c.execute("SELECT * FROM conversations WHERE mode='bot' AND session=?", (session,)).fetchall()
     acted = 0
@@ -2228,6 +2273,71 @@ def back_to_bot(cid):
                       f"Você receberá aviso nas próximas mensagens.")
 
 
+def format_phone(cid):
+    if not cid or "@" not in cid:
+        return cid or ""
+    clean = cid.split("@")[0]
+    if clean.startswith("55") and len(clean) == 13:
+        return f"+55 ({clean[2:4]}) {clean[4:9]}-{clean[9:]}"
+    if clean.startswith("55") and len(clean) == 12:
+        return f"+55 ({clean[2:4]}) {clean[4:8]}-{clean[8:]}"
+    if len(clean) == 11:
+        return f"({clean[0:2]}) {clean[2:7]}-{clean[7:]}"
+    return clean
+
+
+def sync_waha_contacts_and_groups(session=None):
+    """Sincroniza contatos e grupos do WAHA preenchendo nomes reais em conversations."""
+    sessions_to_sync = [session] if session else SESSIONS
+    updated_count = 0
+    with db() as c:
+        for s in sessions_to_sync:
+            try:
+                # 1. Contatos individuais
+                contacts = waha("GET", f"/api/contacts/all?session={s}", timeout=30)
+                if isinstance(contacts, list):
+                    for ct in contacts:
+                        cid = ct.get("id")
+                        if not cid:
+                            continue
+                        name = (ct.get("name") or ct.get("pushname") or "").strip()
+                        if name:
+                            cur = c.execute("""
+                                UPDATE conversations 
+                                SET name=? 
+                                WHERE session=? AND id=? AND (name IS NULL OR name='' OR name LIKE '55%')
+                            """, (name, s, cid))
+                            updated_count += cur.rowcount
+            except Exception as e:
+                print(json.dumps({"t": now_iso(), "sync_contacts_err": str(e), "session": s}), flush=True)
+
+            try:
+                # 2. Grupos
+                groups = waha("GET", f"/api/{s}/groups", timeout=30)
+                if isinstance(groups, dict):
+                    for gid, gdata in groups.items():
+                        subject = (gdata.get("subject") or "").strip() if isinstance(gdata, dict) else ""
+                        if subject:
+                            cur = c.execute("""
+                                UPDATE conversations 
+                                SET name=?, is_group=1 
+                                WHERE session=? AND id=? AND (name IS NULL OR name='' OR name LIKE '120%' OR name LIKE '55%')
+                            """, (subject, s, gid))
+                            updated_count += cur.rowcount
+            except Exception as e:
+                print(json.dumps({"t": now_iso(), "sync_groups_err": str(e), "session": s}), flush=True)
+
+    return updated_count
+
+
+@app.post("/api/contacts/sync")
+def api_contacts_sync():
+    """Endpoint para sincronizar nomes de contatos e grupos do WAHA sob demanda."""
+    session = request.args.get("s") or _req_session()
+    n = sync_waha_contacts_and_groups(session)
+    return jsonify({"ok": True, "updated": n, "session": session})
+
+
 @app.get("/api/conversations")
 def api_conversations():
     q = (request.args.get("q") or "").strip().lower()
@@ -2244,11 +2354,17 @@ def api_conversations():
             ).fetchall()
     out = []
     for r in rows:
-        if q and q not in ((r["name"] or "") + " " + (r["last_message_preview"] or "")).lower():
+        phone_fmt = format_phone(r["id"]) if not r["is_group"] else ""
+        raw_name = (r["name"] or "").strip()
+        display_name = raw_name if raw_name and not raw_name.startswith("5521") and not raw_name.startswith("12036") else (phone_fmt or r["id"])
+        
+        if q and q not in (display_name + " " + (r["last_message_preview"] or "") + " " + (phone_fmt or "")).lower():
             continue
         out.append({
             "id": r["id"], "session": r["session"], "label": session_label(r["session"]),
-            "name": r["name"] or r["id"],
+            "name": display_name,
+            "raw_name": raw_name,
+            "phone": phone_fmt,
             "is_group": bool(r["is_group"]), "mode": r["mode"],
             "last_message_at": r["last_message_at"], "preview": r["last_message_preview"],
             "unread": r["unread"],
@@ -2693,8 +2809,8 @@ def api_waha_sessions_integrate():
     return jsonify({"ok": True, "slug": slug, "client": cfg})
 
 
-CURRENT_APP_VERSION = "2.2.1"
-CURRENT_VERSION_CODE = 4
+CURRENT_APP_VERSION = "2.2.2"
+CURRENT_VERSION_CODE = 5
 STATIC_DIR = Path(__file__).parent / "static"
 
 @app.get("/api/app/version")
@@ -2927,6 +3043,14 @@ if __name__ == "__main__":
     init_db()
     threading.Thread(target=poller_loop, daemon=True).start()
     threading.Thread(target=bot_loop, daemon=True).start()
+    def _bg_sync_contacts():
+        time.sleep(3)
+        try:
+            sync_waha_contacts_and_groups()
+        except Exception as e:
+            print(json.dumps({"t": now_iso(), "bg_sync_err": str(e)}), flush=True)
+
+    threading.Thread(target=_bg_sync_contacts, daemon=True).start()
     print(json.dumps({"t": now_iso(), "start": "idt-atendimento", "port": PORT,
                       "sessions": SESSIONS, "db": str(DB_PATH),
                       "kb": KB_PATH or None, "bot_mode": BOT_MODE,
