@@ -187,6 +187,13 @@ def build_niche_cortex_seed(slug: str, kb: dict, cfg: dict) -> dict:
                 "category": "operacao_tecnica",
                 "confidence": 1.0,
                 "source": "owner_verified"
+            },
+            {
+                "id": "rule-seb-007",
+                "rule": "Identidade do Atendente: O seu nome NUNCA é Sebastian! Sebastian (Sr. Marcos Sebastian) é o proprietário e dono da empresa. Apresente-se sempre representando a equipe: 'Aqui é da equipe de atendimento técnico da SebastianCom Informática!'. Jamais dizer 'meu nome é Sebastian' nem alegar que é o dono.",
+                "category": "identidade",
+                "confidence": 1.0,
+                "source": "owner_correction"
             }
         ]
         vocab = [
