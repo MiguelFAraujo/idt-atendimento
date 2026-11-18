@@ -76,6 +76,25 @@ except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from mapos_client import MaposClient, MaposClientError
 
+# Cortex Cognitivo Multi-Tenant (aprendizado continuo e maturidade)
+try:
+    from cortex_engine import (
+        get_cortex_prompt_injection,
+        cortex_learn_async,
+        get_or_create_client_cortex,
+        init_all_clients_cortex,
+        record_owner_feedback
+    )
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from cortex_engine import (
+        get_cortex_prompt_injection,
+        cortex_learn_async,
+        get_or_create_client_cortex,
+        init_all_clients_cortex,
+        record_owner_feedback
+    )
+
 # ---------------------------------------------------------------- config
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("ATEND_DATA", "/mnt/storage/lab/data/idt-atendimento"))
@@ -1326,6 +1345,14 @@ def build_system_prompt(kb, slot_labels=None, client_dir=None):
     if slot_labels:
         parts.append("Horários livres para agendamento: " + ", ".join(slot_labels[:6]) + ". Peça escolha apenas se o cliente pedir agendamento.")
 
+    if client_dir:
+        try:
+            cortex_inj = get_cortex_prompt_injection(Path(client_dir))
+            if cortex_inj:
+                parts.append(cortex_inj)
+        except Exception as e:
+            pass
+
     return "\n".join(p for p in parts if p)
 
 
@@ -2005,6 +2032,14 @@ def bot_process_conversation(session, cid, mode, send=True, advance=True):
         elif status == "error":
             BOT_STATE["errors"] += 1
         BOT_STATE["last_error"] = None if status == "reply" else reason
+
+        # Cortex Cognitivo: extração de aprendizado em segundo plano
+        if client_dir and status in ("reply", "handoff"):
+            try:
+                cortex_learn_async(session, cid, inbound_text, reply or "", Path(client_dir), cfg or {})
+            except Exception as e:
+                pass
+
         print(json.dumps({"t": now_iso(), "bot": status, "cid": cid, "reason": reason,
                           "model": model_used, "dry": out["dry"]}), flush=True)
         return out
@@ -3036,6 +3071,12 @@ def api_waha_sessions_integrate():
         except Exception:
             pass
 
+    # Inicializa o Cortex cognitivo para o novo cliente
+    try:
+        get_or_create_client_cortex(client_dir, display)
+    except Exception as e:
+        print(json.dumps({"t": now_iso(), "cortex_init_err": str(e), "slug": slug}), flush=True)
+
     return jsonify({"ok": True, "slug": slug, "client": cfg})
 
 
@@ -3067,6 +3108,56 @@ def api_app_version():
         "updated_at": apk_mtime,
         "release_notes": "Versão 2.2.4: Inteligência multimodal (Áudio STT Groq Whisper, Visão Nemotron, Vídeo áudio+frame) e foco em conversão de bancada SebastianCom sem diagnóstico prematuro."
     })
+
+
+@app.get("/api/clients/cortex/overview")
+def api_clients_cortex_overview():
+    """Retorna visão geral de maturidade de todos os clientes."""
+    if not _authorized():
+        return jsonify({"error": "nao autorizado"}), 403
+    try:
+        overview = init_all_clients_cortex(CLIENTS_DIR)
+        return jsonify({"ok": True, "clients": overview})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.get("/api/clients/<path:session_or_slug>/cortex")
+def api_get_client_cortex(session_or_slug):
+    """Retorna estado cognitivo, regras aprendidas e maturidade de um cliente específico."""
+    if not _authorized():
+        return jsonify({"error": "nao autorizado"}), 403
+    cfg = load_client_config(session_or_slug)
+    client_dir = None
+    if cfg and cfg.get("_client_dir"):
+        client_dir = Path(cfg["_client_dir"])
+    else:
+        cand = CLIENTS_DIR / session_or_slug
+        if cand.is_dir():
+            client_dir = cand
+    if not client_dir or not client_dir.exists():
+        return jsonify({"ok": False, "error": "client_not_found"}), 404
+
+    data = get_or_create_client_cortex(client_dir, (cfg or {}).get("display", session_or_slug))
+    return jsonify({"ok": True, "cortex": data})
+
+
+@app.post("/api/clients/<path:session_or_slug>/cortex/learn")
+def api_post_client_cortex_rule(session_or_slug):
+    """Registra uma nova regra ou instrução direta do proprietário."""
+    if not _authorized():
+        return jsonify({"error": "nao autorizado"}), 403
+    body = request.get_json(silent=True) or {}
+    rule_text = (body.get("rule") or "").strip()
+    source = (body.get("source") or "owner_manual").strip()
+    if not rule_text:
+        return jsonify({"ok": False, "error": "empty_rule"}), 400
+    cfg = load_client_config(session_or_slug)
+    client_dir = Path(cfg["_client_dir"]) if (cfg and cfg.get("_client_dir")) else (CLIENTS_DIR / session_or_slug)
+    if not client_dir.exists():
+        return jsonify({"ok": False, "error": "client_not_found"}), 404
+    rule = record_owner_feedback(client_dir, rule_text, source=source)
+    return jsonify({"ok": True, "rule": rule})
 
 
 @app.get("/api/bot/os")
@@ -3271,6 +3362,10 @@ def api_events_stream():
 
 if __name__ == "__main__":
     init_db()
+    try:
+        init_all_clients_cortex(CLIENTS_DIR)
+    except Exception as e:
+        print(json.dumps({"t": now_iso(), "cortex_all_init_err": str(e)}), flush=True)
     threading.Thread(target=poller_loop, daemon=True).start()
     threading.Thread(target=bot_loop, daemon=True).start()
     def _bg_sync_contacts():
