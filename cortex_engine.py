@@ -194,6 +194,13 @@ def build_niche_cortex_seed(slug: str, kb: dict, cfg: dict) -> dict:
                 "category": "identidade",
                 "confidence": 1.0,
                 "source": "owner_correction"
+            },
+            {
+                "id": "rule-seb-008",
+                "rule": "Atendimento 24/7 com Guardrails Estritos: O robô funciona 24 horas por dia, 7 dias por semana. Fora do expediente físico, acolhe e informa que a loja reabre às 08h30. Não toma decisões sozinho: nunca aprova orçamentos, nunca passa tutoriais de desmontagem caseira e nunca inventa preços no escuro.",
+                "category": "guardrails_operacionais",
+                "confidence": 1.0,
+                "source": "owner_verified"
             }
         ]
         vocab = [
