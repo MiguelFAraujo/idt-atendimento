@@ -247,6 +247,9 @@ BOT_GROUPS = os.getenv("ATEND_BOT_GROUPS", "0") == "1"
 BOT_HISTORY = int(os.getenv("ATEND_BOT_HISTORY", "8"))
 # --- Thread pool for async OmniRoute calls ---
 OMNI_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="omni")
+# --- In-flight concurrency lock to prevent duplicate bot processing / race conditions ---
+BOT_PROCESSING_LOCK = threading.Lock()
+BOT_IN_FLIGHT = set()
 # --- F4: agenda (slots deterministicos a partir da KB) ---
 BOOKING_STEP_MIN = int(os.getenv("ATEND_BOOKING_STEP", "60"))
 BOOKING_DAYS = int(os.getenv("ATEND_BOOKING_DAYS", "7"))
@@ -1069,55 +1072,71 @@ def build_system_prompt(kb, slot_labels=None, client_dir=None):
     hor = kb.get("horarios") or {}
     servs = kb.get("servicos") or []
     faq = kb.get("faq") or []
-    parts = [f"Voce e o atendente automatico de {neg.get('nome', 'o negocio')} no WhatsApp."]
-    if neg.get("descricao"):
-        parts.append(neg["descricao"])
-    if hor:
-        parts.append("Horario: " + "; ".join(f"{k}: {v}" for k, v in hor.items()))
-    if servs:
-        parts.append("Servicos: " + "; ".join(f"{s.get('nome')}" for s in servs if s.get("nome")))
-    if kb.get("marcas"):
-        parts.append("Marcas: " + ", ".join(kb["marcas"]))
-    # FAQ resumido: apenas 3-5 essenciais para nao inflar prompt
-    if faq:
-        parts.append("FAQs chave:")
-        parts.extend(f"- {q.get('pergunta')} -> {q.get('resposta')}" for q in faq[:5])
-    if kb.get("tom"):
-        parts.append("Tom: " + str(kb["tom"]))
     
-    # Few-shot dinâmico do cliente
-    fewshot_examples = load_fewshot(client_dir) if client_dir else DEFAULT_FEWSHOT
-    if fewshot_examples:
-        parts.append("EXEMPLOS DE RESPOSTA (siga exatamente este estilo):")
-        for ex in fewshot_examples:
-            role = ex.get("role", "")
-            content = ex.get("content", "")
-            if role == "user":
-                parts.append(f"Usuario: {content}")
-            elif role == "assistant":
-                parts.append(f"Bot: {content}")
-    
-    rules = [
-        "Responda SOMENTE com base no acima. Nao invente precos, prazos, promocoes.",
-        "Se nao souber, responda exatamente [[HANDOFF]] e nada mais.",
-        "Nao de diagnostico definitivo sem ver equipamento; nao prometa prazo exato.",
-        "Risco (bateria inchada, cheiro queimado, liquido): diga DESLIGUE e traga a loja.",
-        "SEJA BREVE: 2-3 frases maximo. Tom WhatsApp natural. Nao use 'Ola, como posso ajudar?'.",
-        "Nao repita telefone/email/link - o cliente ja esta no WhatsApp da loja.",
+    parts = [
+        f"Você é o atendente técnico especializado de {neg.get('nome', 'SebastianCom Informática')} no WhatsApp.",
+        f"Localização da loja física: {neg.get('endereco', 'Avenida Vereador Francisco Sabino da Costa, 398 - Centro, Maricá - RJ')}.",
+        f"Experiência: {neg.get('experiencia', 'Mais de 25 anos de tradição em assistência técnica de informática e eletrônica em Maricá-RJ')}.",
+        f"Descrição: {neg.get('descricao', 'Assistência técnica especializada em impressoras, computadores, notebooks e PC gamer em Maricá-RJ')}."
     ]
-    for r in (kb.get("restricoes") or []):
-        rules.append(str(r))
+    if hor:
+        parts.append("Horários de funcionamento: " + "; ".join(f"{k}: {v}" for k, v in hor.items()))
+    if servs:
+        parts.append("Serviços prestados: " + "; ".join(f"{s.get('nome')}: {s.get('descricao', '')}" for s in servs if s.get("nome")))
+    if kb.get("marcas"):
+        parts.append("Marcas atendidas: " + ", ".join(kb["marcas"]))
+
+    parts.append(
+        "\n🧠 ESPECIALIDADE TÉCNICA VERTICALIZADA:\n"
+        "- IMPRESSORAS (Epson EcoTank L3150/L3250/L4260, HP DeskJet/LaserJet, Canon, Brother):\n"
+        "  * Não puxa papel / atolamento: rolete tracionador (pickup roller) sujo/gasto, sensor travado ou papel preso. Orientar limpeza suave ou trazer para troca do rolete.\n"
+        "  * Falha de impressão ou linhas brancas: cabeça de impressão entupida (orientar limpeza pelo software), tinta ressecada ou ar nos dutos.\n"
+        "  * Luzes piscando alternadas: almofadas de tinta no fim da vida útil (reset de software e drenagem) ou erro de sensor.\n"
+        "  * Não liga ou vazamento: orientar desligar e trazer para análise na bancada.\n"
+        "- NOTEBOOKS E COMPUTADORES:\n"
+        "  * Lentidão ou travando: recomendar upgrade essencial para SSD NVMe/SATA + memória RAM (solução com melhor ganho de velocidade).\n"
+        "  * Não liga / não dá vídeo: testar carregador/fonte, conector DC jack, oxidação em RAM ou curto em placa-mãe.\n"
+        "  * Desligando sozinho / esquentando: manutenção preventiva térmica (limpeza interna, troca de pasta térmica e revisão do cooler).\n"
+        "  * Formatação: instalação limpa de Windows 10/11 com preservação de arquivos (backup completo), ativação e drivers oficiais.\n"
+        "  * Danos físicos: conserto de dobradiça, carcaça quebrada, troca de teclado e tela.\n"
+        "- PC GAMER: Montagem completa personalizada, upgrades de placa de vídeo (RTX/Radeon) e fonte, airflow e otimização para jogos."
+    )
+
+    parts.append(
+        "\n💬 DIRETRIZES DE ATENDIMENTO:\n"
+        "1. Seja atencioso, técnico e natural como um atendente experiente conversando no WhatsApp.\n"
+        "2. Responda em no máximo 2 a 4 frases concisas e acolhedoras. NUNCA mande textões longos nem listas gigantes.\n"
+        "3. Faça perguntas diagnósticas úteis quando necessário (ex: marca/modelo exato, se acende luz ou faz barulho).\n"
+        "4. NUNCA invente preços exatos ou prazos definitivos sem ver a máquina. Explique que o orçamento exato é feito após avaliação física na bancada da loja.\n"
+        "5. Confirme serviços com segurança: se o cliente perguntar se formata, conserta impressora ou troca SSD, confirme com clareza ('Fazemos sim!') e oriente como proceder.\n"
+        "6. Risco elétrico/físico (bateria estufada, cheiro de queimado, líquido): recomende desligar imediatamente da tomada e trazer à loja.\n"
+        "7. Se o cliente solicitar expressamente falar com uma pessoa, responda cordialmente que está transferindo para a equipe humana.\n"
+        "8. Lembre o cliente de que ele pode consultar o status de qualquer Ordem de Serviço enviando '/os <número>'."
+    )
+
+    # FAQs essenciais
+    if faq:
+        parts.append("\nPerguntas Frequentes de Referência:")
+        for q in faq[:5]:
+            parts.append(f"- P: {q.get('pergunta')} -> R: {q.get('resposta')}")
+
     if slot_labels:
-        rules.append("So ofereca horario se PEDIR agendar. Livres: " + ", ".join(slot_labels[:6]) + ". Peca escolha.")
-    parts.append("Regras:")
-    parts.extend("- " + r for r in rules)
+        parts.append("Horários livres para agendamento: " + ", ".join(slot_labels[:6]) + ". Peça escolha apenas se o cliente pedir agendamento.")
+
     return "\n".join(p for p in parts if p)
 
 
 def omni_chat(messages, model=None, max_tokens=None):
     """Chama o OmniRoute com fallback ordenado. Retorna {ok, model, content} ou {ok:False,error}."""
     primary = model or OMNI_MODEL
-    models = [primary] + [m for m in OMNI_FALLBACK if m and m != primary]
+    # Fallback order: primary, gratis (kilo-auto/free), flash
+    fallbacks = [m for m in (["gratis", "flash", "best-chat"] + OMNI_FALLBACK) if m and m != primary]
+    seen = {primary}
+    models = [primary]
+    for m in fallbacks:
+        if m not in seen:
+            seen.add(m)
+            models.append(m)
     last_err = None
     
     def _call_model(m):
@@ -1128,24 +1147,28 @@ def omni_chat(messages, model=None, max_tokens=None):
         req.add_header("Content-Type", "application/json")
         if OMNI_KEY:
             req.add_header("Authorization", "Bearer " + OMNI_KEY)
-        with urllib.request.urlopen(req, timeout=OMNI_TIMEOUT) as r:
+        with urllib.request.urlopen(req, timeout=15) as r:
             d = json.loads(r.read().decode() or "{}")
         choice = (d.get("choices") or [{}])[0]
         content = ((choice.get("message") or {}).get("content") or "").strip()
-        if content and choice.get("finish_reason") != "length":
-            return {"ok": True, "model": d.get("model") or m, "content": content}
+        # Clean <think>...</think> reasoning tags
+        if "<think>" in content:
+            content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
         if content:
-            raise Exception(f"{m}: resposta truncada")
+            if choice.get("finish_reason") == "length" and len(content) > 30:
+                last_p = max(content.rfind("."), content.rfind("!"), content.rfind("?"))
+                if last_p > 20:
+                    content = content[:last_p + 1].strip()
+            return {"ok": True, "model": d.get("model") or m, "content": content}
         raise Exception(f"{m}: resposta vazia")
     
     for m in models:
         try:
             future = OMNI_EXECUTOR.submit(_call_model, m)
-            # Use a slightly shorter timeout to allow for fallback
-            res = future.result(timeout=OMNI_TIMEOUT - 2)
+            res = future.result(timeout=16)
             return res
         except FuturesTimeoutError:
-            last_err = f"{m}: timeout ({OMNI_TIMEOUT}s)"
+            last_err = f"{m}: timeout (16s)"
         except Exception as e:
             last_err = f"{m}: {type(e).__name__}: {e}"
     return {"ok": False, "error": last_err or "sem modelo"}
@@ -1167,7 +1190,12 @@ def validate_reply(reply, kb, inbound_text=None, session=None):
     if "[[HANDOFF]]" in r.upper():
         return False, "handoff solicitado"
     if len(r) > BOT_MAX_REPLY:
-        return False, "resposta longa demais"
+        # Gracefully trim at sentence boundary before BOT_MAX_REPLY instead of discarding
+        last_period = max(r[:BOT_MAX_REPLY].rfind("."), r[:BOT_MAX_REPLY].rfind("!"), r[:BOT_MAX_REPLY].rfind("?"))
+        if last_period > 100:
+            r = r[:last_period + 1].strip()
+        else:
+            return False, "resposta longa demais"
     kbtext = _kb_text(kb)
     for m in PRICE_RE.findall(r):
         num = re.sub(r"[^\d]", "", m)
@@ -1176,29 +1204,6 @@ def validate_reply(reply, kb, inbound_text=None, session=None):
     for m in PROMISE_RE.findall(r):
         if _strip_accents(m).lower() not in kbtext:
             return False, f"promessa nao autorizada: {m}"
-    # Validacao FAQ mais flexivel: threshold 30% (era 50%), permite parafrasear
-    if inbound_text:
-        faq = kb.get("faq") or []
-        inbound_norm = _strip_accents(inbound_text or "").lower()
-        for q in faq:
-            p = _strip_accents(q.get("pergunta") or "").lower()
-            # Match simples: se a pergunta do FAQ está contida na mensagem do usuário
-            if p in inbound_norm or inbound_norm in p:
-                # Verifica se a resposta do LLM é compatível com a do FAQ
-                faq_resp = _strip_accents(q.get("resposta") or "").lower()
-                reply_norm = _strip_accents(r).lower()
-                # Check overlap: palavras-chave da resposta do FAQ devem aparecer na resposta do LLM
-                faq_words = set(w for w in faq_resp.split() if len(w) > 3)
-                reply_words = set(w for w in reply_norm.split() if len(w) > 3)
-                if faq_words and len(faq_words & reply_words) < max(1, len(faq_words) // 3):
-                    return False, f"resposta diverge do FAQ: {q.get('pergunta')}"
-    # Enforce brevity for sebastiancom: hard truncate to ~400 chars if longer
-    if session == "cli-002-sebastiancom" and len(r) > 400:
-        # Truncate at last sentence boundary before 400 chars
-        truncated = r[:400]
-        last_period = max(truncated.rfind("."), truncated.rfind("!"), truncated.rfind("?"))
-        if last_period > 100:  # Only truncate if we have a reasonable sentence
-            return False, f"resposta longa demais para sebastiancom (truncado em {last_period+1} chars)"
     return True, "ok"
 
 
@@ -1276,10 +1281,10 @@ INTENT_RE = re.compile(
     r"\b(agendar|agenda|agendamento|marcar|horario|horarios|disponivel|disponiveis|"
     r"pode ser|que horas|tem vaga|encaixe|quero (?:levar|trazer|agendar|um horario))\b", re.I)
 
-OS_INTENT_RE = re.compile(
-    r"\b(abrir\s+os|nova\s+os|nova\s+ordem|criar\s+os|abrir\s+ordem|or[cç]amento|consertar|reparar|"
-    r"quebrad[ao]|defeituos[ao]|n[aã]o\s+liga|n[aã]o\s+funciona|problema|defeito|manuten[cç][aã]o|"
-    r"tela\s+quebrad[ao]|bateria|carregador|microfone|alto-falante|c[aâ]mera)\b", re.I)
+OS_CREATE_EXPLICIT_RE = re.compile(
+    r"\b(pode\s+abrir\s+(?:a\s+)?os|quero\s+abrir\s+(?:uma\s+)?os|abrir\s+(?:nova\s+)?os|"
+    r"abrir\s+(?:a\s+)?ordem\s+de\s+servi[cç]o|criar\s+(?:a\s+)?os|solicito\s+(?:abertura\s+de\s+)?os|"
+    r"confirmo\s+(?:a\s+)?abertura)\b", re.I)
 
 
 def detect_booking_intent(text):
@@ -1287,8 +1292,13 @@ def detect_booking_intent(text):
 
 
 def detect_os_intent(text):
-    """Detecta intenção de criar uma OS (ordem de serviço)."""
-    return bool(OS_INTENT_RE.search(_strip_accents(text or "").lower()))
+    """Detecta se o cliente pediu expressamente para abrir uma OS (nunca em consultas ou troubleshoot)."""
+    if not text:
+        return False
+    t = _strip_accents(text or "").lower()
+    if re.search(r"(?:/os\s*|status\s*(?:da\s*)?os\s*|consultar\s*os\s*)\d+", t):
+        return False
+    return bool(OS_CREATE_EXPLICIT_RE.search(t))
 
 
 def parse_slot_choice(text, slots):
@@ -1364,18 +1374,19 @@ def extract_os_info_from_text(text, kb):
     
     # Padrões comuns de produtos
     device_patterns = [
+        (r"\b(impressora|epson|hp\s*deskjet|laserjet|canon|brother|ecotank)\b", "Impressora"),
+        (r"\b(notebook|notebbok|note\s*book|laptop)\b", "Notebook"),
+        (r"\b(computador|pc|desktop|gabinete|pc\s*gamer)\b", "Computador"),
         (r"\b(iPhone\s*\d+\w*)\b", "iPhone"),
         (r"\b(iPad\s*\w*)\b", "iPad"),
         (r"\b(MacBook\s*\w*)\b", "MacBook"),
         (r"\b(Samsung\s*\w*)\b", "Samsung"),
         (r"\b(Xiaomi\s*\w*)\b", "Xiaomi"),
         (r"\b(Motorola\s*\w*)\b", "Motorola"),
-        (r"\b(notebook|notebbok|note\s*book)\b", "Notebook"),
         (r"\b(celular|smartphone|telefone)\b", "Smartphone"),
         (r"\b(tablet)\b", "Tablet"),
-        (r"\b(computador|pc|desktop)\b", "Computador"),
-        (r"\b(fone|headphone|headset|airpods)\b", "Fone de ouvido"),
-        (r"\b(carregador|cabo)\b", "Carregador"),
+        (r"\b(monitor)\b", "Monitor"),
+        (r"\b(nobreak|estabilizador)\b", "Nobreak"),
     ]
     
     for pattern, label in device_patterns:
@@ -1393,6 +1404,13 @@ def extract_os_info_from_text(text, kb):
     
     # Extrai defeito específico se mencionado
     defeito_keywords = {
+        "nao puxa papel": "Impressora não puxa papel / rolete tracionador",
+        "papel preso": "Atolamento de papel",
+        "atolando": "Atolamento de papel",
+        "falha de impressao": "Falha na impressão / cabeçote entupido",
+        "linhas brancas": "Falha de impressão / cabeçote entupido",
+        "luz piscando": "Luzes piscando / almofadas de tinta ou sensor",
+        "almofada": "Almofadas de tinta cheias (requer reset)",
         "tela quebrada": "Tela quebrada/trincada",
         "tela trincada": "Tela trincada",
         "nao liga": "Não liga",
@@ -1411,10 +1429,14 @@ def extract_os_info_from_text(text, kb):
         "botao": "Botão quebrado",
         "botão": "Botão quebrado",
         "touch": "Touch não funciona",
-        "lento": "Lentidão/travamento",
-        "trava": "Travamento",
-        "esquenta": "Superaquecimento",
-        "quente": "Superaquecimento",
+        "lento": "Lentidão / necessidade de upgrade SSD/RAM",
+        "lentidao": "Lentidão / necessidade de upgrade SSD/RAM",
+        "trava": "Travamento / sistema",
+        "travando": "Travamento / sistema",
+        "esquenta": "Superaquecimento / limpeza térmica e pasta",
+        "quente": "Superaquecimento / limpeza térmica e pasta",
+        "formatar": "Formatação com backup e instalação de sistema",
+        "ssd": "Troca / upgrade de SSD",
     }
     
     for keyword, desc in defeito_keywords.items():
@@ -1467,322 +1489,329 @@ def _quiet_now():
     return h >= BOT_QUIET_START or h < BOT_QUIET_END
 
 def match_faq(kb, text):
-    """Match user message to FAQ entry. Returns FAQ answer if match, else None."""
+    """Match user message to FAQ entry. Only matches EXACT full questions (min 10 chars)."""
     if not text or not kb:
         return None
     faq = kb.get("faq") or []
     if not faq:
         return None
     
-    import re
-    # Normalize text
-    t = text.lower().strip()
-    # Remove punctuation for matching
-    t_clean = re.sub(r'[?!.\,;:\-]', '', t)
+    t = _strip_accents(text or "").lower().strip()
+    t_clean = re.sub(r'[?!.,;:\-]', '', t).strip()
+    if len(t_clean) < 10:
+        return None
     
     for q in faq:
         pergunta = (q.get("pergunta") or "").lower().strip()
-        pergunta_clean = re.sub(r'[?!.\,;:\-]', '', pergunta)
+        pergunta_clean = re.sub(r'[?!.,;:\-]', '', _strip_accents(pergunta)).strip()
         resposta = q.get("resposta") or ""
-        
-        # Exact match or containment (both ways)
-        if pergunta_clean == t_clean or pergunta_clean in t_clean or t_clean in pergunta_clean:
+        if pergunta_clean and t_clean == pergunta_clean:
             return resposta
-        
-        # Word overlap matching for partial matches
-        p_words = set(w for w in pergunta_clean.split() if len(w) > 3)
-        t_words = set(w for w in t_clean.split() if len(w) > 3)
-        if p_words and t_words:
-            overlap = len(p_words & t_words)
-            if overlap >= max(1, len(p_words) // 2):  # At least 50% of FAQ keywords present
-                return resposta
     
     return None
 
 
 def bot_process_conversation(session, cid, mode, send=True, advance=True):
     """Monta prompt -> LLM propoe -> executor valida -> (envia | handoff)."""
-    kb = load_kb(session)
-    if not kb:
-        return {"cid": cid, "session": session, "action": "skip", "reason": "KB ausente"}
-    
-    # Load client config for tenant-aware processing
-    cfg = load_client_config(session)
-    tenant_id = cfg.get("nome", session) if cfg else session
-    client_dir = Path(cfg["_client_dir"]) if cfg and cfg.get("_client_dir") else None
-    
-    with db() as c:
-        conv = c.execute("SELECT * FROM conversations WHERE session=? AND id=?", (session, cid)).fetchone()
-        if not conv:
-            return {"cid": cid, "session": session, "action": "skip", "reason": "sem conversa"}
-        rows = c.execute(
-            "SELECT * FROM messages WHERE conversation_id=? AND session=? ORDER BY timestamp DESC LIMIT ?",
-            (cid, session, BOT_HISTORY)).fetchall()
-    msgs = list(reversed(rows))
-    last_in = next((m for m in reversed(msgs) if not m["from_me"]), None)
-    if not last_in:
-        return {"cid": cid, "action": "skip", "reason": "sem inbound"}
-    inbound_text = last_in["body"] or ""
+    # Trava de concorrência: impede execuções duplicadas simultâneas da mesma conversa
+    with BOT_PROCESSING_LOCK:
+        if (session, cid) in BOT_IN_FLIGHT:
+            return {"cid": cid, "session": session, "action": "skip", "reason": "already_processing"}
+        BOT_IN_FLIGHT.add((session, cid))
 
-    # Defense-in-depth safety checks
-    if conv["mode"] != "bot":
-        return {"cid": cid, "session": session, "action": "skip", "reason": "modo_humano"}
-
-    if conv["is_group"] and not BOT_GROUPS:
-        return {"cid": cid, "session": session, "action": "skip", "reason": "grupos_desativados"}
-
-    now = int(time.time())
-    msg_age = now - int(last_in["timestamp"] or 0)
-    max_age = int(os.getenv("BOT_MAX_INBOUND_AGE", "900"))
-    if msg_age > max_age:
-        if advance:
-            with db() as c:
-                c.execute("UPDATE conversations SET bot_last_inbound_id=? WHERE session=? AND id=?",
-                          (last_in["id"], session, cid))
-        return {"cid": cid, "session": session, "action": "skip", "reason": f"stale_inbound_{msg_age}s"}
-
-    if send:
-        # Se for qualquer número que NÃO seja o do operador (21988743980), bloqueia disparo ao vivo
-        if not is_dispatch_permitted(cid):
-            send = False
-        effective_mode = _bot_effective_mode()
-        if effective_mode == "off":
-            return {"cid": cid, "session": session, "action": "skip", "reason": "bot_desligado"}
-        if not bot_allowed(session, cid):
-            return {"cid": cid, "session": session, "action": "skip", "reason": "fora_da_allowlist"}
-    
-    # HUMAN INTENT DETECTION - Check BEFORE LLM call
-    handoff_triggers = cfg.get("handoff_triggers", [
-        "atendente", "humano", "pessoa real", "reclamar", "nao resolve",
-        "urgente", "falar com atendente", "quero humano", "transferir"
-    ]) if cfg else [
-        "atendente", "humano", "pessoa real", "reclamar", "nao resolve",
-        "urgente", "falar com atendente", "quero humano", "transferir"
-    ]
-    if detect_human_intent(inbound_text, handoff_triggers):
-        # Immediate handoff
-        with db() as c:
-            c.execute(
-                "UPDATE conversations SET mode='humano', updated_at=? WHERE session=? AND id=?",
-                (now_iso(), session, cid)
-            )
-        # Notify owner via Telegram with inline buttons
-        if NOTIFY_ENABLED:
-            _notify_handoff(session, cid, tenant_id, inbound_text, cfg)
-        _emit_bot_event(session, "handoff_pending", {"cid": cid, "inbound": inbound_text[:200], "tenant_id": tenant_id})
-        return {"cid": cid, "session": session, "action": "handoff", "reason": "human_intent_detected", "tenant_id": tenant_id}
-    
-    # FAQ-FIRST MATCHING: Check for exact FAQ match before LLM call
-    # This avoids hallucinations and ensures short deterministic responses for sebastiancom
-    faq_match = match_faq(kb, inbound_text)
-    if faq_match:
-        reply = faq_match
-        sent_mid = None
-        if send:
-            try:
-                sent_mid = waha_send_text(conv["session"], cid, reply)
-                _emit_bot_event(session, "bot_replied", {"cid": cid, "reply": reply, "sent_id": sent_mid, "source": "faq"})
-            except Exception as e:
-                return {"cid": cid, "session": session, "action": "error", "reason": f"send: {type(e).__name__}: {e}"}
+    try:
+        kb = load_kb(session)
+        if not kb:
+            return {"cid": cid, "session": session, "action": "skip", "reason": "KB ausente"}
         
+        # Load client config for tenant-aware processing
+        cfg = load_client_config(session)
+        tenant_id = cfg.get("nome", session) if cfg else session
+        client_dir = Path(cfg["_client_dir"]) if cfg and cfg.get("_client_dir") else None
+        
+        with db() as c:
+            conv = c.execute("SELECT * FROM conversations WHERE session=? AND id=?", (session, cid)).fetchone()
+            if not conv:
+                return {"cid": cid, "session": session, "action": "skip", "reason": "sem conversa"}
+            rows = c.execute(
+                "SELECT * FROM messages WHERE conversation_id=? AND session=? ORDER BY timestamp DESC LIMIT ?",
+                (cid, session, BOT_HISTORY)).fetchall()
+        msgs = list(reversed(rows))
+        last_in = next((m for m in reversed(msgs) if not m["from_me"]), None)
+        if not last_in:
+            return {"cid": cid, "action": "skip", "reason": "sem inbound"}
+        
+        # Deduplicação: se já respondemos a esta mensagem inbound específica, pula
+        if "bot_last_inbound_id" in conv.keys() and conv["bot_last_inbound_id"] == last_in["id"]:
+            return {"cid": cid, "session": session, "action": "skip", "reason": "already_replied"}
+        
+        inbound_text = (last_in["body"] or "").strip()
+
+        # Defense-in-depth safety checks
+        if conv["mode"] != "bot":
+            return {"cid": cid, "session": session, "action": "skip", "reason": "modo_humano"}
+
+        if conv["is_group"] and not BOT_GROUPS:
+            return {"cid": cid, "session": session, "action": "skip", "reason": "grupos_desativados"}
+
+        now = int(time.time())
+        msg_age = now - int(last_in["timestamp"] or 0)
+        max_age = int(os.getenv("BOT_MAX_INBOUND_AGE", "900"))
+        if msg_age > max_age:
+            if advance:
+                with db() as c:
+                    c.execute("UPDATE conversations SET bot_last_inbound_id=? WHERE session=? AND id=?",
+                              (last_in["id"], session, cid))
+            return {"cid": cid, "session": session, "action": "skip", "reason": f"stale_inbound_{msg_age}s"}
+
+        if send:
+            # Se for qualquer número que NÃO seja o do operador (21988743980), bloqueia disparo ao vivo
+            if not is_dispatch_permitted(cid):
+                send = False
+            effective_mode = _bot_effective_mode()
+            if effective_mode == "off":
+                return {"cid": cid, "session": session, "action": "skip", "reason": "bot_desligado"}
+            if not bot_allowed(session, cid):
+                return {"cid": cid, "session": session, "action": "skip", "reason": "fora_da_allowlist"}
+        
+        # HUMAN INTENT DETECTION - Check BEFORE LLM call
+        handoff_triggers = cfg.get("handoff_triggers", [
+            "atendente", "humano", "pessoa real", "reclamar", "nao resolve",
+            "urgente", "falar com atendente", "quero humano", "transferir"
+        ]) if cfg else [
+            "atendente", "humano", "pessoa real", "reclamar", "nao resolve",
+            "urgente", "falar com atendente", "quero humano", "transferir"
+        ]
+        if detect_human_intent(inbound_text, handoff_triggers):
+            # Immediate handoff
+            with db() as c:
+                c.execute(
+                    "UPDATE conversations SET mode='humano', updated_at=? WHERE session=? AND id=?",
+                    (now_iso(), session, cid)
+                )
+            # Notify owner via Telegram with inline buttons
+            if NOTIFY_ENABLED:
+                _notify_handoff(session, cid, tenant_id, inbound_text, cfg)
+            _emit_bot_event(session, "handoff_pending", {"cid": cid, "inbound": inbound_text[:200], "tenant_id": tenant_id})
+            return {"cid": cid, "session": session, "action": "handoff", "reason": "human_intent_detected", "tenant_id": tenant_id}
+        
+        # 1. CONSULTA DE STATUS DE ORDEM DE SERVIÇO (/os 33, /os33, status da os 33, consultar os 33)
+        m_os = re.search(r"(?:^|[^\w])(?:/os\s*|status\s*(?:da\s*)?os\s*|consultar\s*os\s*|os\s*#?)(\d+)\b", inbound_text, re.I)
+        booking = None
+        os_created = None
+        reply = None
+        status = None
+        reason = None
+        model_used = None
+
+        if m_os:
+            target_os_id = int(m_os.group(1))
+            try:
+                os_detail = MAPOS.get_os_detail(target_os_id)
+                if os_detail and os_detail.get("status") and os_detail.get("result", {}).get("os"):
+                    info = os_detail["result"]["os"]
+                    st = info.get("status", "Em andamento")
+                    prod = info.get("descricaoProduto", "Equipamento")
+                    def_rel = info.get("defeito", "Não informado")
+                    laudo = info.get("laudoTecnico") or info.get("observacoes") or ""
+                    val = info.get("valorTotal")
+                    
+                    os_reply = (
+                        f"📋 *Ordem de Serviço #{target_os_id}*\n\n"
+                        f"🔹 *Equipamento:* {prod}\n"
+                        f"🔹 *Status atual:* *{st}*\n"
+                        f"🔹 *Defeito relatado:* {def_rel}\n"
+                    )
+                    if laudo:
+                        os_reply += f"🔹 *Parecer Técnico:* {laudo}\n"
+                    if val and float(val) > 0:
+                        os_reply += f"🔹 *Valor Total:* R$ {float(val):.2f}\n"
+                    os_reply += "\nQualquer dúvida adicional ou se precisar agendar a retirada, é só chamar por aqui! 🔧"
+                    reply = os_reply
+                    status, reason = "reply", "consulta_os"
+                    model_used = "mapos_api"
+                else:
+                    reply = (
+                        f"🔍 Não localizei a Ordem de Serviço #{target_os_id} no sistema da SebastianCom. "
+                        f"Por favor, confirme se o número está correto ou me envie seu nome completo para localizarmos!"
+                    )
+                    status, reason = "reply", "consulta_os_nao_encontrada"
+                    model_used = "mapos_api"
+            except Exception as e:
+                reply = f"Não consegui consultar a OS #{target_os_id} no momento ({type(e).__name__}). Um atendente humano pode verificar para você em instantes."
+                status, reason = "reply", "consulta_os_erro"
+                model_used = "mapos_api"
+
+        # 2. FAQ EXACT MATCH: Apenas se pergunta completa e idêntica
+        if not reply:
+            faq_match = match_faq(kb, inbound_text)
+            if faq_match:
+                reply = faq_match
+                status, reason = "reply", "faq_match"
+                model_used = "faq"
+
+        # 3. ATENDIMENTO TÉCNICO VERTICALIZADO VIA LLM (OmniRoute)
+        if not reply:
+            media_type = last_in["media_type"] if "media_type" in last_in.keys() else None
+            has_media = last_in["has_media"] if "has_media" in last_in.keys() else None
+            media_content = None
+            media_mime = None
+            if has_media and media_type:
+                media_bytes = waha_download_media(session, last_in["id"])
+                if media_bytes:
+                    media_content = media_bytes
+                    mime_map = {
+                        "image": "image/jpeg",
+                        "audio": "audio/ogg",
+                        "video": "video/mp4",
+                        "document": "application/pdf",
+                        "sticker": "image/webp",
+                    }
+                    media_mime = mime_map.get(media_type, "application/octet-stream")
+
+            offer = free_slots(kb, session, limit=6)
+            all_slots = free_slots(kb, session)
+            chat = [{"role": "system", "content": build_system_prompt(kb, [slot_label(s) for s in offer], client_dir)}]
+            for m in msgs:
+                role = "assistant" if m["from_me"] else "user"
+                content = (m["body"] or "[midia]")[:1000]
+                chat.append({"role": role, "content": content})
+
+            if media_content and media_mime:
+                import base64
+                b64 = base64.b64encode(media_content).decode()
+                for i in range(len(chat) - 1, -1, -1):
+                    if chat[i]["role"] == "user":
+                        chat[i] = {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": inbound_text or "[midia]"},
+                                {"type": "image_url" if media_mime.startswith("image") else "media",
+                                 "image_url" if media_mime.startswith("image") else "media": {
+                                     "url": f"data:{media_mime};base64,{b64}"
+                                 }}
+                            ]
+                        }
+                        break
+
+            model_for_media = "auto/best-vision" if media_content else None
+            max_tokens_override = 800
+
+            _emit_bot_event(session, "bot_thinking", {"cid": cid, "inbound": inbound_text[:200], "has_media": bool(media_content)})
+            res = omni_chat(chat, model=model_for_media, max_tokens=max_tokens_override)
+            model_used = res.get("model")
+
+            # Detecta intenção de agendamento
+            if res.get("ok") and detect_booking_intent(inbound_text):
+                chosen = parse_slot_choice(inbound_text, all_slots)
+                if chosen:
+                    booking = create_booking(session, cid, chosen)
+
+            # Detecta intenção EXPLÍCITA de criar OS (apenas sob confirmação direta do cliente)
+            if res.get("ok") and detect_os_intent(inbound_text):
+                try:
+                    os_data = extract_os_info_from_text(inbound_text, kb)
+                    if os_data:
+                        os_result = MAPOS.create_os(
+                            descricao_produto=os_data.get("descricao_produto", "Dispositivo não especificado"),
+                            defeito=os_data.get("defeito", inbound_text),
+                            observacoes=os_data.get("observacoes", "")
+                        )
+                        if os_result and os_result.get("id"):
+                            os_id = os_result["id"]
+                            os_created = os_result
+                            with db() as c:
+                                c.execute(
+                                    "INSERT OR REPLACE INTO os_conversation_map (os_id, session, cid, created_at) VALUES (?, ?, ?, ?)",
+                                    (os_id, session, cid, now_iso())
+                                )
+                except Exception as e:
+                    print(json.dumps({"t": now_iso(), "os_create_error": str(e)}), flush=True)
+
+            if booking and booking.get("ok"):
+                reply, status, reason = (
+                    f"Fechado! Agendei para {booking['label']}. "
+                    f"Se precisar remarcar, é só chamar por aqui. 🔧"), "reply", "agendamento"
+            elif os_created and os_created.get("id"):
+                reply, status, reason = (
+                    f"✅ Ordem de Serviço #{os_created['id']} aberta com sucesso! "
+                    f"Traga o equipamento na SebastianCom (Av. Vereador Francisco Sabino da Costa, 398 - Centro) para avaliação. "
+                    f"Use /os {os_created['id']} para consultar status."), "reply", "os_criada"
+            elif not res.get("ok"):
+                reply, status, reason = "", "handoff", res.get("error") or "erro LLM"
+                if NOTIFY_ENABLED:
+                    _notify_handoff(session, cid, tenant_id, inbound_text, cfg)
+                    _emit_bot_event(session, "handoff_pending", {"cid": cid, "inbound": inbound_text[:200], "tenant_id": tenant_id})
+            else:
+                ok, why = validate_reply(res["content"], kb, inbound_text, session)
+                reply = res["content"]
+                status, reason = ("reply", "ok") if ok else ("handoff", why)
+
+        # Notify owner via Telegram on validation failure handoff
+        if status == "handoff" and NOTIFY_ENABLED:
+            _notify_handoff(session, cid, tenant_id, inbound_text, cfg)
+            _emit_bot_event(session, "handoff_pending", {"cid": cid, "inbound": inbound_text[:200], "tenant_id": tenant_id})
+
         now = int(time.time())
         today = _local_now().strftime("%Y-%m-%d")
+        sent_mid = None
+        if status == "reply" and send:
+            try:
+                sent_mid = waha_send_text(conv["session"], cid, reply)
+                _emit_bot_event(session, "bot_replied", {"cid": cid, "reply": reply, "sent_id": sent_mid, "model": model_used})
+            except Exception as e:
+                status, reason = "error", f"send: {type(e).__name__}: {e}"
+
         with db() as c:
             if sent_mid:
-                upsert_message(c, {"id": sent_mid, "fromMe": True, "body": reply, "timestamp": now}, conv["session"], cid)
+                upsert_message(c, {"id": sent_mid, "fromMe": True, "body": reply,
+                                   "timestamp": now}, conv["session"], cid)
+            if status == "handoff":
+                c.execute("UPDATE conversations SET mode='humano' WHERE session=? AND id=?",
+                          (session, cid))
             count = int(conv["bot_replies_count"] or 0) if conv["bot_replies_day"] == today else 0
-            if send:
+            if status == "reply" and send:
                 count += 1
-            stored = ("[DRY] " + reply) if not send else reply
+            stored = ("[DRY] " + reply) if (status == "reply" and not send) else (reply or None)
             c.execute(
                 """UPDATE conversations SET
                      bot_last_inbound_id=CASE WHEN ? THEN ? ELSE bot_last_inbound_id END,
                      bot_last_reply_at=CASE WHEN ? THEN ? ELSE bot_last_reply_at END,
                      bot_last_reply=COALESCE(?, bot_last_reply),
-                     bot_last_error=NULL,
-                     bot_replies_day=?,
-                     bot_replies_count=?
+                     bot_last_error=?, bot_replies_day=?, bot_replies_count=?
                    WHERE session=? AND id=?""",
                 (1 if advance else 0, last_in["id"],
-                 1 if send else 0, now,
-                 stored, today, count, session, cid))
-        BOT_STATE["last_reply"] = reply
-        if send:
-            BOT_STATE["replies"] += 1
-        else:
-            BOT_STATE["dry"] += 1
-        BOT_STATE["last_error"] = None
-        print(json.dumps({"t": now_iso(), "bot": "reply", "cid": cid, "reason": "faq_match", "model": "faq", "dry": not send}), flush=True)
-        return {"cid": cid, "session": session, "action": "reply", "reason": "faq_match", "model": "faq", "reply": reply, "sent_id": sent_mid, "dry": not send}
-
-    # --- Media handling: check if inbound has media (audio, image, video) ---
-    # --- Media handling: check if inbound has media (audio, image, video) ---
-    media_type = last_in["media_type"] if "media_type" in last_in.keys() else None
-    has_media = last_in["has_media"] if "has_media" in last_in.keys() else None
-    media_content = None
-    media_mime = None
-    if has_media and media_type:
-        media_bytes = waha_download_media(session, last_in["id"])
-        if media_bytes:
-            media_content = media_bytes
-            # Map WAHA media_type to MIME for model
-            mime_map = {
-                "image": "image/jpeg",
-                "audio": "audio/ogg",
-                "video": "video/mp4",
-                "document": "application/pdf",
-                "sticker": "image/webp",
-            }
-            media_mime = mime_map.get(media_type, "application/octet-stream")
-        else:
-            pass
-    offer = free_slots(kb, session, limit=6)
-    all_slots = free_slots(kb, session)
-    chat = [{"role": "system", "content": build_system_prompt(kb, [slot_label(s) for s in offer], client_dir)}]
-    for m in msgs:
-        role = "assistant" if m["from_me"] else "user"
-        content = (m["body"] or "[midia]")[:1000]
-        chat.append({"role": role, "content": content})
-    # If last inbound has media, append media to last user message for multimodal model
-    if media_content and media_mime:
-        import base64
-        b64 = base64.b64encode(media_content).decode()
-        # Replace last user message with multimodal content
-        for i in range(len(chat) - 1, -1, -1):
-            if chat[i]["role"] == "user":
-                chat[i] = {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": inbound_text or "[midia]"},
-                        {"type": "image_url" if media_mime.startswith("image") else "media",
-                         "image_url" if media_mime.startswith("image") else "media": {
-                             "url": f"data:{media_mime};base64,{b64}"
-                         }}
-                    ]
-                }
-                break
-    # Use multimodal model for media messages
-    model_for_media = "auto/best-vision" if media_content else None
-    
-    # Per-session token limit: lower for sebastiancom to force brevity
-    max_tokens_override = 300 if session == "cli-002-sebastiancom" else OMNI_MAX_TOKENS
-    
-    _emit_bot_event(session, "bot_thinking", {"cid": cid, "inbound": inbound_text[:200], "has_media": bool(media_content)})
-    res = omni_chat(chat, model=model_for_media, max_tokens=max_tokens_override)
-    booking = None
-    os_created = None
-    
-    # Detecta intenção de agendamento
-    if res.get("ok") and detect_booking_intent(inbound_text):
-        chosen = parse_slot_choice(inbound_text, all_slots)
-        if chosen:
-            booking = create_booking(session, cid, chosen)
-    
-    # Detecta intenção de criar OS
-    if res.get("ok") and detect_os_intent(inbound_text):
-        try:
-            # Extrai informações do texto para criar OS
-            os_data = extract_os_info_from_text(inbound_text, kb)
-            if os_data:
-                os_result = MAPOS.create_os(
-                    descricao_produto=os_data.get("descricao_produto", "Dispositivo não especificado"),
-                    defeito=os_data.get("defeito", inbound_text),
-                    observacoes=os_data.get("observacoes", "")
-                )
-                if os_result and os_result.get("id"):
-                    os_id = os_result["id"]
-                    os_created = os_result
-                    # Salva mapeamento os_id -> cid para notificações futuras
-                    with db() as c:
-                        c.execute(
-                            "INSERT OR REPLACE INTO os_conversation_map (os_id, session, cid, created_at) VALUES (?, ?, ?, ?)",
-                            (os_id, session, cid, now_iso())
-                        )
-        except Exception as e:
-            print(json.dumps({"t": now_iso(), "os_create_error": str(e)}), flush=True)
-    
-    if booking and booking.get("ok"):
-        reply, status, reason = (
-            f"Fechado! Agendei para {booking['label']}. "
-            f"Se precisar remarcar, e so chamar por aqui. 🔧"), "reply", "agendamento"
-    elif os_created and os_created.get("id"):
-        reply, status, reason = (
-            f"✅ OS #{os_created['id']} criada com sucesso! "
-            f"Seu dispositivo será avaliado e entraremos em contato. "
-            f"Use /os {os_created['id']} para consultar status."), "reply", "os_criada"
-    elif not res.get("ok"):
-        reply, status, reason = "", "handoff", res.get("error") or "erro LLM"
-        # Notify owner via Telegram on LLM error handoff
-        if NOTIFY_ENABLED:
-            _notify_handoff(session, cid, tenant_id, inbound_text, cfg)
-            _emit_bot_event(session, "handoff_pending", {"cid": cid, "inbound": inbound_text[:200], "tenant_id": tenant_id})
-    else:
-        ok, why = validate_reply(res["content"], kb, inbound_text, session)
-        reply = res["content"]
-        status, reason = ("reply", "ok") if ok else ("handoff", why)
-    # Notify owner via Telegram on validation failure handoff
-    if status == "handoff" and NOTIFY_ENABLED:
-        _notify_handoff(session, cid, tenant_id, inbound_text, cfg)
-        _emit_bot_event(session, "handoff_pending", {"cid": cid, "inbound": inbound_text[:200], "tenant_id": tenant_id})
-    now = int(time.time())
-    today = _local_now().strftime("%Y-%m-%d")
-    sent_mid = None
-    print(json.dumps({"t": now_iso(), "debug": "send_block_enter", "status": status, "send": send, "cid": cid, "session": session}), flush=True)
-    if status == "reply" and send:
-        try:
-            print(json.dumps({"t": now_iso(), "debug": "waha_send_text_call", "cid": cid, "session": session, "reply_len": len(reply)}), flush=True)
-            sent_mid = waha_send_text(conv["session"], cid, reply)
-            print(json.dumps({"t": now_iso(), "debug": "waha_send_text_result", "cid": cid, "sent_mid": sent_mid}), flush=True)
-            _emit_bot_event(session, "bot_replied", {"cid": cid, "reply": reply, "sent_id": sent_mid})
-        except Exception as e:
-            print(json.dumps({"t": now_iso(), "debug": "send_exception", "cid": cid, "error": f"{type(e).__name__}: {e}"}), flush=True)
-            status, reason = "error", f"send: {type(e).__name__}: {e}"
-    with db() as c:
-        if sent_mid:
-            upsert_message(c, {"id": sent_mid, "fromMe": True, "body": reply,
-                               "timestamp": now}, conv["session"], cid)
-        if status == "handoff":
-            c.execute("UPDATE conversations SET mode='humano' WHERE session=? AND id=?",
-                      (session, cid))
-        count = int(conv["bot_replies_count"] or 0) if conv["bot_replies_day"] == today else 0
-        if status == "reply" and send:
-            count += 1
-        stored = ("[DRY] " + reply) if (status == "reply" and not send) else (reply or None)
-        c.execute(
-            """UPDATE conversations SET
-                 bot_last_inbound_id=CASE WHEN ? THEN ? ELSE bot_last_inbound_id END,
-                 bot_last_reply_at=CASE WHEN ? THEN ? ELSE bot_last_reply_at END,
-                 bot_last_reply=COALESCE(?, bot_last_reply),
-                 bot_last_error=?, bot_replies_day=?, bot_replies_count=?
-               WHERE session=? AND id=?""",
-            (1 if advance else 0, last_in["id"],
-             1 if (status == "reply" and send) else 0, now,
-             stored, None if status == "reply" else reason, today, count, session, cid))
-    out = {"cid": cid, "session": session, "action": status, "reason": reason, "model": res.get("model"),
-           "reply": reply, "sent_id": sent_mid, "booking": booking, "os_created": os_created,
-           "dry": bool(status == "reply" and not send)}
-    if status == "reply":
-        BOT_STATE["last_reply"] = reply
-        if send:
-            BOT_STATE["replies"] += 1
-        else:
-            BOT_STATE["dry"] += 1
-    elif status == "handoff":
-        BOT_STATE["handoff"] += 1
-        if send and NOTIFY_ENABLED:
-            tg_send(
-                f"🤖➡️👤 <b>Bot pediu reforco</b> — {_h(conv['name'] or cid)}\n"
-                f"📱 <i>{_h(session_label(session))}</i>\n"
-                f"Motivo: {_h(reason)}\nUltima msg: {_h(inbound_text[:200])}\n"
-                f"<i>Conversa passada para humano.</i>",
-                [[{"text": "Abrir conversa",
-                   "url": f"{PUBLIC_URL}/?token={APP_TOKEN}&s={quote(session, safe='')}&conv={quote(cid, safe='')}"}]])
-    elif status == "error":
-        BOT_STATE["errors"] += 1
-    BOT_STATE["last_error"] = None if status == "reply" else reason
-    print(json.dumps({"t": now_iso(), "bot": status, "cid": cid, "reason": reason,
-                      "model": out["model"], "dry": out["dry"]}), flush=True)
-    return out
+                 1 if (status == "reply" and send) else 0, now,
+                 stored, None if status == "reply" else reason, today, count, session, cid))
+        
+        out = {"cid": cid, "session": session, "action": status, "reason": reason, "model": model_used,
+               "reply": reply, "sent_id": sent_mid, "booking": booking, "os_created": os_created,
+               "dry": bool(status == "reply" and not send)}
+        if status == "reply":
+            BOT_STATE["last_reply"] = reply
+            if send:
+                BOT_STATE["replies"] += 1
+            else:
+                BOT_STATE["dry"] += 1
+        elif status == "handoff":
+            BOT_STATE["handoff"] += 1
+            if send and NOTIFY_ENABLED:
+                tg_send(
+                    f"🤖➡️👤 <b>Bot pediu reforco</b> — {_h(conv['name'] or cid)}\n"
+                    f"📱 <i>{_h(session_label(session))}</i>\n"
+                    f"Motivo: {_h(reason)}\nUltima msg: {_h(inbound_text[:200])}\n"
+                    f"<i>Conversa passada para humano.</i>",
+                    [[{"text": "Abrir conversa",
+                       "url": f"{PUBLIC_URL}/?token={APP_TOKEN}&s={quote(session, safe='')}&conv={quote(cid, safe='')}"}]])
+        elif status == "error":
+            BOT_STATE["errors"] += 1
+        BOT_STATE["last_error"] = None if status == "reply" else reason
+        print(json.dumps({"t": now_iso(), "bot": status, "cid": cid, "reason": reason,
+                          "model": model_used, "dry": out["dry"]}), flush=True)
+        return out
+    finally:
+        with BOT_PROCESSING_LOCK:
+            BOT_IN_FLIGHT.discard((session, cid))
 
 
 def bot_once(mode, session=None):
@@ -2809,8 +2838,8 @@ def api_waha_sessions_integrate():
     return jsonify({"ok": True, "slug": slug, "client": cfg})
 
 
-CURRENT_APP_VERSION = "2.2.2"
-CURRENT_VERSION_CODE = 5
+CURRENT_APP_VERSION = "2.2.3"
+CURRENT_VERSION_CODE = 6
 STATIC_DIR = Path(__file__).parent / "static"
 
 @app.get("/api/app/version")
