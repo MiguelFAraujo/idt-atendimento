@@ -196,10 +196,13 @@ def kb_path_for(session):
 
 
 # ---------------------------------------------------------------- SEGURANÇA ESTRITA DE DISPARO
-ALLOWED_DISPATCH_NUMBERS = {"5521988743980", "21988743980", "5521988743980@c.us"}
+ALLOWED_DISPATCH_NUMBERS = {
+    "5521988743980", "21988743980", "5521988743980@c.us",
+    "5521993164101", "21993164101", "5521993164101@c.us"
+}
 
 def is_dispatch_permitted(chat_id):
-    """Garante que NENHUMA mensagem seja enviada para qualquer número exceto o do operador (21988743980)."""
+    """Garante que NENHUMA mensagem seja enviada para qualquer número exceto os autorizados (operador Miguel e patrão Marcos)."""
     if not chat_id:
         return False
     cid_str = str(chat_id).strip()
