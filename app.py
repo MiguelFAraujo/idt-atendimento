@@ -385,7 +385,7 @@ def waha_send_text(session, cid, text):
     """
     if not is_dispatch_permitted(cid):
         print(json.dumps({"t": now_iso(), "safety_guardrail": "BLOCKED", "blocked_chatId": cid,
-                          "reason": "ENVIO RESTRITO: Apenas o número do operador 21988743980 tem autorização de disparo."}), flush=True)
+                          "reason": "ENVIO RESTRITO: Apenas os números autorizados (Miguel 21988743980 e Marcos Sebastian 21993164101) têm autorização de disparo."}), flush=True)
         return "BLOCKED_BY_SAFETY_GUARDRAIL"
     # Use per-session timeout for sends too
     waha_timeout = int(os.getenv(f"WAHA_TIMEOUT_{session.upper().replace('-', '_')}", str(WAHA_TIMEOUT)))
@@ -411,7 +411,7 @@ def waha_send_buttons(session, cid, text, buttons):
     """
     if not is_dispatch_permitted(cid):
         print(json.dumps({"t": now_iso(), "safety_guardrail": "BLOCKED", "blocked_chatId": cid,
-                          "reason": "ENVIO RESTRITO: Apenas o número do operador 21988743980 tem autorização de disparo."}), flush=True)
+                          "reason": "ENVIO RESTRITO: Apenas os números autorizados (Miguel 21988743980 e Marcos Sebastian 21993164101) têm autorização de disparo."}), flush=True)
         return "BLOCKED_BY_SAFETY_GUARDRAIL"
     waha_timeout = int(os.getenv(f"WAHA_TIMEOUT_{session.upper().replace(chr(45), chr(95))}", str(WAHA_TIMEOUT)))
     waha_buttons = []
@@ -447,7 +447,7 @@ def waha_send_list(session, cid, text, title, description, rows):
     """
     if not is_dispatch_permitted(cid):
         print(json.dumps({"t": now_iso(), "safety_guardrail": "BLOCKED", "blocked_chatId": cid,
-                          "reason": "ENVIO RESTRITO: Apenas o número do operador 21988743980 tem autorização de disparo."}), flush=True)
+                          "reason": "ENVIO RESTRITO: Apenas os números autorizados (Miguel 21988743980 e Marcos Sebastian 21993164101) têm autorização de disparo."}), flush=True)
         return "BLOCKED_BY_SAFETY_GUARDRAIL"
     waha_timeout = int(os.getenv(f"WAHA_TIMEOUT_{session.upper().replace(chr(45), chr(95))}", str(WAHA_TIMEOUT)))
     waha_rows = []
@@ -1828,7 +1828,7 @@ def bot_process_conversation(session, cid, mode, send=True, advance=True):
             return {"cid": cid, "session": session, "action": "skip", "reason": f"stale_inbound_{msg_age}s"}
 
         if send:
-            # Se for qualquer número que NÃO seja o do operador (21988743980), bloqueia disparo ao vivo
+            # Se for qualquer número que NÃO esteja na lista autorizada (Miguel e Marcos Sebastian), bloqueia disparo ao vivo
             if not is_dispatch_permitted(cid):
                 send = False
             effective_mode = _bot_effective_mode()
