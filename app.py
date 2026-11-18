@@ -866,6 +866,7 @@ def migrate_db():
             c.execute("ALTER TABLE messages ADD COLUMN media_url TEXT")
         moved = _rebuild_conversations_composite(c)
         _rebuild_bookings_session(c)
+        _add_tenant_id_column(c)
         c.execute("CREATE INDEX IF NOT EXISTS idx_conv_session ON conversations(session, last_message_at)")
     if moved:
         print(json.dumps({"t": now_iso(), "migrate": "conversations -> PK(session,id)"}), flush=True)
@@ -1509,9 +1510,15 @@ def free_slots(kb, session=None, days=None, step=None, limit=None):
     return out[:limit] if limit else out
 
 
+STORE_HOURS_QUERY_RE = re.compile(
+    r"\b(at[eé]\s+que\s+horas|que\s+horas\s+(?:voc[eê]s?\s+)?(?:fecham?|abrem?|ficam?|atendem?)|"
+    r"qual\s+(?:o\s+)?hor[aá]rio\s+de\s+(?:funcionamento|atendimento)|"
+    r"hor[aá]rio\s+de\s+hoje|abrem?\s+hoje|fecham?\s+hoje|funcionam?\s+hoje)\b", re.I
+)
+
 INTENT_RE = re.compile(
     r"\b(agendar|agenda|agendamento|marcar|horario|horarios|disponivel|disponiveis|"
-    r"pode ser|que horas|tem vaga|encaixe|quero (?:levar|trazer|agendar|um horario))\b", re.I)
+    r"pode ser|tem vaga|encaixe|quero (?:levar|trazer|agendar|um horario))\b", re.I)
 
 OS_CREATE_EXPLICIT_RE = re.compile(
     r"\b(pode\s+abrir\s+(?:a\s+)?os|quero\s+abrir\s+(?:uma\s+)?os|abrir\s+(?:nova\s+)?os|"
@@ -1520,7 +1527,13 @@ OS_CREATE_EXPLICIT_RE = re.compile(
 
 
 def detect_booking_intent(text):
-    return bool(INTENT_RE.search(_strip_accents(text or "").lower()))
+    if not text:
+        return False
+    t = _strip_accents(text).lower()
+    # Perguntas sobre horário de funcionamento da loja NÃO são agendamento
+    if STORE_HOURS_QUERY_RE.search(t):
+        return False
+    return bool(INTENT_RE.search(t))
 
 
 def detect_os_intent(text):
@@ -1579,6 +1592,9 @@ def parse_slot_choice(text, slots):
         if m:
             hour, minute = int(m.group(1)), 0
     if target is None and hour is None:
+        return None
+    # Se não informou hora específica e não pediu explicitamente qualquer vaga, não chuta horário
+    if hour is None and not any(k in t for k in ("qualquer horario", "qualquer hora", "primeiro horario", "primeira vaga", "manha", "tarde")):
         return None
     for iso in slots:
         dt = datetime.strptime(iso, "%Y-%m-%dT%H:%M")
@@ -1931,9 +1947,12 @@ def bot_process_conversation(session, cid, mode, send=True, advance=True):
 
             # Detecta intenção de agendamento
             if res.get("ok") and detect_booking_intent(inbound_text):
-                chosen = parse_slot_choice(inbound_text, all_slots)
-                if chosen:
-                    booking = create_booking(session, cid, chosen)
+                try:
+                    chosen = parse_slot_choice(inbound_text, all_slots)
+                    if chosen:
+                        booking = create_booking(session, cid, chosen)
+                except Exception as e:
+                    print(json.dumps({"t": now_iso(), "booking_create_error": str(e), "session": session, "cid": cid}), flush=True)
 
             # Detecta intenção EXPLÍCITA de criar OS (apenas sob confirmação direta do cliente)
             if res.get("ok") and detect_os_intent(inbound_text):
