@@ -38,13 +38,15 @@ Guardrails: cooldown, teto diario, horario silencioso, allowlist (obrigatoria em
 live) e modo off|dry|live.
 F4: agenda deterministica derivada dos horarios da KB + reservas validadas.
 """
+import base64
+from contextlib import contextmanager
 import json
 import os
 import re
 import sqlite3
-from contextlib import contextmanager
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -454,23 +456,189 @@ def waha_send_list(session, cid, text, title, description, rows):
     return None
 
 
-def waha_download_media(session, message_id):
-    """Baixa mídia do WAHA pelo endpoint /api/{session}/media/{messageId}.
-    
-    Retorna bytes da mídia ou None se falhar.
+def waha_fetch_media_content(session, message_id, cid=None, media_url=None):
+    """Baixa mídia do WAHA. Se media_url não for informada, consulta /api/{session}/chats/{cid}/messages/{mid}.
+    Retorna (bytes, mimetype, filename) ou (None, None, None).
     """
     try:
-        path = f"/api/{session}/media/{message_id}"
-        # GET sem payload, timeout maior para download de mídia
-        waha_timeout = int(os.getenv(f"WAHA_TIMEOUT_{session.upper().replace('-', '_')}", str(WAHA_TIMEOUT * 3)))
-        url = f"{WAHA_URL}{path}"
-        req = urllib.request.Request(url, method="GET")
-        req.add_header("X-Api-Key", waha_api_key())
-        with urllib.request.urlopen(req, timeout=waha_timeout) as r:
-            return r.read()
+        url_to_fetch = media_url
+        if not url_to_fetch and cid:
+            path = f"/api/{session}/chats/{cid}/messages/{message_id}"
+            req = urllib.request.Request(f"{WAHA_URL}{path}")
+            req.add_header("X-Api-Key", waha_api_key())
+            waha_timeout = int(os.getenv(f"WAHA_TIMEOUT_{session.upper().replace('-', '_')}", str(WAHA_TIMEOUT * 2)))
+            with urllib.request.urlopen(req, timeout=waha_timeout) as r:
+                msg_data = json.loads(r.read())
+                media_info = msg_data.get("media") or {}
+                url_to_fetch = media_info.get("url")
+
+        if not url_to_fetch:
+            return None, None, None
+
+        if url_to_fetch.startswith("http://localhost:3000"):
+            url_to_fetch = url_to_fetch.replace("http://localhost:3000", WAHA_URL)
+        elif url_to_fetch.startswith("/"):
+            url_to_fetch = f"{WAHA_URL}{url_to_fetch}"
+
+        req2 = urllib.request.Request(url_to_fetch)
+        req2.add_header("X-Api-Key", waha_api_key())
+        dl_timeout = int(os.getenv(f"WAHA_TIMEOUT_{session.upper().replace('-', '_')}", str(WAHA_TIMEOUT * 4)))
+        with urllib.request.urlopen(req2, timeout=dl_timeout) as r2:
+            content_type = r2.headers.get("Content-Type", "application/octet-stream")
+            return r2.read(), content_type, None
     except Exception as e:
-        print(json.dumps({"t": now_iso(), "waha_download_media": "error", "session": session, "message_id": message_id, "err": str(e)}), flush=True)
+        print(json.dumps({"t": now_iso(), "waha_fetch_media_error": str(e), "session": session, "cid": cid, "mid": message_id}), flush=True)
+        return None, None, None
+
+
+def waha_download_media(session, message_id, cid=None, media_url=None):
+    """Compatibilidade: baixa mídia e retorna bytes ou None."""
+    data, _, _ = waha_fetch_media_content(session, message_id, cid=cid, media_url=media_url)
+    return data
+
+
+def transcribe_audio_bytes(audio_bytes, mimetype="audio/ogg"):
+    """Transcreve áudio via OmniRoute /v1/audio/transcriptions com Groq Whisper."""
+    if not audio_bytes or len(audio_bytes) < 100:
         return None
+
+    models_to_try = ["groq/whisper-large-v3", "groq/whisper-large-v3-turbo"]
+    clean_mime = (mimetype or "audio/ogg").split(";")[0].strip()
+    ext = "ogg"
+    if "mp4" in clean_mime or "m4a" in clean_mime:
+        ext = "m4a"
+    elif "wav" in clean_mime:
+        ext = "wav"
+    elif "mpeg" in clean_mime or "mp3" in clean_mime:
+        ext = "mp3"
+
+    for model in models_to_try:
+        try:
+            boundary = f"----AudioBoundary{int(time.time()*1000)}"
+            body = bytearray()
+            body.extend(f"--{boundary}\r\n".encode())
+            body.extend(b"Content-Disposition: form-data; name=\"model\"\r\n\r\n")
+            body.extend(f"{model}\r\n".encode())
+
+            body.extend(f"--{boundary}\r\n".encode())
+            body.extend(b"Content-Disposition: form-data; name=\"language\"\r\n\r\n")
+            body.extend(b"pt\r\n")
+
+            body.extend(f"--{boundary}\r\n".encode())
+            body.extend(f"Content-Disposition: form-data; name=\"file\"; filename=\"audio.{ext}\"\r\n".encode())
+            body.extend(f"Content-Type: {clean_mime}\r\n\r\n".encode())
+            body.extend(audio_bytes)
+            body.extend(b"\r\n")
+            body.extend(f"--{boundary}--\r\n".encode())
+
+            req = urllib.request.Request(f"{OMNI_URL}/audio/transcriptions", data=body, method="POST")
+            req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+            if OMNI_KEY:
+                req.add_header("Authorization", f"Bearer {OMNI_KEY}")
+
+            with urllib.request.urlopen(req, timeout=20) as r:
+                res = json.loads(r.read())
+                text = (res.get("text") or "").strip()
+                if text:
+                    return text
+        except Exception as e:
+            print(json.dumps({"t": now_iso(), "transcribe_audio_error": f"{model}: {e}"}), flush=True)
+
+    return None
+
+
+def describe_image_bytes(image_bytes, mimetype="image/jpeg"):
+    """Descreve imagem do equipamento/erro usando modelo de visão."""
+    if not image_bytes or len(image_bytes) < 100:
+        return None
+    try:
+        clean_mime = (mimetype or "image/jpeg").split(";")[0].strip()
+        b64 = base64.b64encode(image_bytes).decode()
+        payload = {
+            "model": "kilo/nvidia/nemotron-3.5-super-vl:free",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Você é um atendente técnico de assistência técnica de informática. Descreva de forma objetiva o que aparece nesta imagem enviada pelo cliente (equipamento, marca/modelo se visível, luzes acesas, mensagem de erro ou estado físico), em no máximo 1 ou 2 frases curtas em português."
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{clean_mime};base64,{b64}"}
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 400,
+            "temperature": 0.2
+        }
+        req = urllib.request.Request(f"{OMNI_URL}/chat/completions", data=json.dumps(payload).encode(), method="POST")
+        req.add_header("Content-Type", "application/json")
+        if OMNI_KEY:
+            req.add_header("Authorization", f"Bearer {OMNI_KEY}")
+
+        with urllib.request.urlopen(req, timeout=20) as r:
+            res = json.loads(r.read())
+            choice = res.get("choices", [{}])[0]
+            msg = choice.get("message", {})
+            content = (msg.get("content") or "").strip()
+            if "<think>" in content:
+                content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+            if not content and msg.get("reasoning"):
+                lines = [line.strip() for line in msg["reasoning"].split("\n") if line.strip() and not line.strip().startswith("The user") and not line.strip().startswith("1.") and not line.strip().startswith("2.")]
+                if lines:
+                    content = lines[-1]
+            return content or None
+    except Exception as e:
+        print(json.dumps({"t": now_iso(), "describe_image_error": str(e)}), flush=True)
+        return None
+
+
+def process_video_bytes(video_bytes, mimetype="video/mp4"):
+    """Extrai áudio e keyframe de vídeo e gera transcrição e descrição visual."""
+    if not video_bytes or len(video_bytes) < 500:
+        return None, None
+
+    tf_path = None
+    frame_path = None
+    audio_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
+            tf.write(video_bytes)
+            tf_path = tf.name
+
+        frame_path = tf_path + ".jpg"
+        audio_path = tf_path + ".ogg"
+
+        # 1. Extrai keyframe em 1s
+        cmd_frame = ["ffmpeg", "-y", "-ss", "00:00:01", "-i", tf_path, "-vframes", "1", "-q:v", "2", frame_path]
+        subprocess.run(cmd_frame, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+
+        visual_desc = None
+        if os.path.exists(frame_path) and os.path.getsize(frame_path) > 500:
+            with open(frame_path, "rb") as f:
+                visual_desc = describe_image_bytes(f.read(), "image/jpeg")
+
+        # 2. Extrai áudio para transcrição
+        cmd_audio = ["ffmpeg", "-y", "-i", tf_path, "-vn", "-c:a", "libopus", "-b:a", "32k", audio_path]
+        subprocess.run(cmd_audio, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+
+        audio_transcript = None
+        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 500:
+            with open(audio_path, "rb") as f:
+                audio_transcript = transcribe_audio_bytes(f.read(), "audio/ogg")
+
+        return audio_transcript, visual_desc
+    except Exception as e:
+        print(json.dumps({"t": now_iso(), "process_video_error": str(e)}), flush=True)
+        return None, None
+    finally:
+        for p in (tf_path, frame_path, audio_path):
+            if p and os.path.exists(p):
+                try: os.remove(p)
+                except Exception: pass
 
 
 # ---------------------------------------------------------------- db
@@ -671,6 +839,9 @@ def migrate_db():
             CREATE INDEX IF NOT EXISTS idx_os_map_cid ON os_conversation_map(session, cid);
             """
         )
+        msg_cols = {r["name"] for r in c.execute("PRAGMA table_info(messages)")}
+        if "media_url" not in msg_cols:
+            c.execute("ALTER TABLE messages ADD COLUMN media_url TEXT")
         moved = _rebuild_conversations_composite(c)
         _rebuild_bookings_session(c)
         c.execute("CREATE INDEX IF NOT EXISTS idx_conv_session ON conversations(session, last_message_at)")
@@ -701,17 +872,18 @@ def upsert_message(c, m, session, conv_id):
         body = media.get("filename") or media.get("mimetype") or "[midia]"
     c.execute(
         """INSERT INTO messages (id, conversation_id, session, from_me, sender, body,
-                                 has_media, media_type, timestamp, ack, created_at, tenant_id)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                                 has_media, media_type, timestamp, ack, created_at, tenant_id, media_url)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(id) DO UPDATE SET
              body=excluded.body, ack=excluded.ack, has_media=excluded.has_media,
-             media_type=excluded.media_type""",
+             media_type=excluded.media_type,
+             media_url=COALESCE(excluded.media_url, messages.media_url)""",
         (
             mid, conv_id, session, 1 if m.get("fromMe") else 0,
             str(m.get("from") or ""), body, 1 if m.get("hasMedia") else 0,
             # Clamp timestamp to now + 60s to handle future-dated timestamps from WAHA
             media.get("mimetype"), min(int(m.get("timestamp") or 0), int(time.time()) + 60),
-            int(m.get("ack") or 0), now_iso(), tenant_id,
+            int(m.get("ack") or 0), now_iso(), tenant_id, media.get("url"),
         ),
     )
     return True
@@ -1072,46 +1244,45 @@ def build_system_prompt(kb, slot_labels=None, client_dir=None):
     hor = kb.get("horarios") or {}
     servs = kb.get("servicos") or []
     faq = kb.get("faq") or []
-    
+
     parts = [
-        f"Você é o atendente técnico especializado de {neg.get('nome', 'SebastianCom Informática')} no WhatsApp.",
-        f"Localização da loja física: {neg.get('endereco', 'Avenida Vereador Francisco Sabino da Costa, 398 - Centro, Maricá - RJ')}.",
-        f"Experiência: {neg.get('experiencia', 'Mais de 25 anos de tradição em assistência técnica de informática e eletrônica em Maricá-RJ')}.",
-        f"Descrição: {neg.get('descricao', 'Assistência técnica especializada em impressoras, computadores, notebooks e PC gamer em Maricá-RJ')}."
+        f"Você é o atendente técnico especializado da {neg.get('nome', 'SebastianCom Informática')} no WhatsApp.",
+        f"Localização física da loja: {neg.get('endereco', 'Avenida Vereador Francisco Sabino da Costa, 398 - Centro, Maricá - RJ')}.",
+        f"Experiência e tradição: {neg.get('experiencia', 'Mais de 25 anos de tradição em assistência técnica e eletrônica em Maricá-RJ')}.",
+        f"Horários de atendimento: {'; '.join(f'{k}: {v}' for k, v in hor.items()) if hor else 'Segunda a Sexta 08h às 18h | Sábados 08h às 12h'}."
     ]
-    if hor:
-        parts.append("Horários de funcionamento: " + "; ".join(f"{k}: {v}" for k, v in hor.items()))
-    if servs:
-        parts.append("Serviços prestados: " + "; ".join(f"{s.get('nome')}: {s.get('descricao', '')}" for s in servs if s.get("nome")))
-    if kb.get("marcas"):
-        parts.append("Marcas atendidas: " + ", ".join(kb["marcas"]))
 
     parts.append(
-        "\n🧠 ESPECIALIDADE TÉCNICA VERTICALIZADA:\n"
-        "- IMPRESSORAS (Epson EcoTank L3150/L3250/L4260, HP DeskJet/LaserJet, Canon, Brother):\n"
-        "  * Não puxa papel / atolamento: rolete tracionador (pickup roller) sujo/gasto, sensor travado ou papel preso. Orientar limpeza suave ou trazer para troca do rolete.\n"
-        "  * Falha de impressão ou linhas brancas: cabeça de impressão entupida (orientar limpeza pelo software), tinta ressecada ou ar nos dutos.\n"
-        "  * Luzes piscando alternadas: almofadas de tinta no fim da vida útil (reset de software e drenagem) ou erro de sensor.\n"
-        "  * Não liga ou vazamento: orientar desligar e trazer para análise na bancada.\n"
-        "- NOTEBOOKS E COMPUTADORES:\n"
-        "  * Lentidão ou travando: recomendar upgrade essencial para SSD NVMe/SATA + memória RAM (solução com melhor ganho de velocidade).\n"
-        "  * Não liga / não dá vídeo: testar carregador/fonte, conector DC jack, oxidação em RAM ou curto em placa-mãe.\n"
-        "  * Desligando sozinho / esquentando: manutenção preventiva térmica (limpeza interna, troca de pasta térmica e revisão do cooler).\n"
-        "  * Formatação: instalação limpa de Windows 10/11 com preservação de arquivos (backup completo), ativação e drivers oficiais.\n"
-        "  * Danos físicos: conserto de dobradiça, carcaça quebrada, troca de teclado e tela.\n"
-        "- PC GAMER: Montagem completa personalizada, upgrades de placa de vídeo (RTX/Radeon) e fonte, airflow e otimização para jogos."
+        "\n🎯 OBJETIVO PRIMORDIAL (CONVERSÃO DE BALCÃO):\n"
+        "Seu foco absoluto em cada atendimento é fazer o cliente trazer o equipamento para a nossa loja física.\n"
+        "Nossa empresa é um negócio comercial (NÃO somos filantrópicos). Nosso lucro e faturamento dependem dos aparelhos entrarem na nossa bancada para avaliação técnica e abertura de Ordem de Serviço."
     )
 
     parts.append(
-        "\n💬 DIRETRIZES DE ATENDIMENTO:\n"
-        "1. Seja atencioso, técnico e natural como um atendente experiente conversando no WhatsApp.\n"
-        "2. Responda em no máximo 2 a 4 frases concisas e acolhedoras. NUNCA mande textões longos nem listas gigantes.\n"
-        "3. Faça perguntas diagnósticas úteis quando necessário (ex: marca/modelo exato, se acende luz ou faz barulho).\n"
-        "4. NUNCA invente preços exatos ou prazos definitivos sem ver a máquina. Explique que o orçamento exato é feito após avaliação física na bancada da loja.\n"
-        "5. Confirme serviços com segurança: se o cliente perguntar se formata, conserta impressora ou troca SSD, confirme com clareza ('Fazemos sim!') e oriente como proceder.\n"
-        "6. Risco elétrico/físico (bateria estufada, cheiro de queimado, líquido): recomende desligar imediatamente da tomada e trazer à loja.\n"
-        "7. Se o cliente solicitar expressamente falar com uma pessoa, responda cordialmente que está transferindo para a equipe humana.\n"
-        "8. Lembre o cliente de que ele pode consultar o status de qualquer Ordem de Serviço enviando '/os <número>'."
+        "\n🚫 REGRA CRÍTICA DE OURO — NÃO ENTREGAR DIAGNÓSTICO NEM SOLUÇÕES CASEIRAS:\n"
+        "1. NUNCA tente adivinhar o defeito ou dar diagnósticos por WhatsApp (JAMAIS diga 'o defeito pode ser o cabeçote, a placa, a fonte, a memória RAM, o rolete, o fusor, etc.').\n"
+        "2. NUNCA ensine o cliente a consertar em casa (JAMAIS diga 'tente limpar com álcool', 'resete com o botão', 'abra a tampa', 'troque de tomada', 'veja no software'). Se você der diagnóstico ou dica caseira, o cliente tenta fazer sozinho, piora a máquina ou leva para outro lugar, e a loja perde o serviço e a margem!\n"
+        "3. Como conduzir com autoridade técnica e ética:\n"
+        "   - Acolha e valide a queixa do cliente com empatia ('Compreendo perfeitamente, esse tipo de falha realmente atrapalha o trabalho e precisa de atenção...').\n"
+        "   - Explique por que NÃO damos diagnóstico por mensagem: 'Sintomas como esse têm diversas causas possíveis (desde oscilação elétrica até componentes internos na placa ou mecanismo). Passar um palpite ou orçamento no escuro por WhatsApp seria antiético e colocaria seu aparelho em risco de queimar ou agravar o dano.'\n"
+        "   - Justifique a bancada: 'Para um diagnóstico exato, seguro e com garantia, precisamos abrir e testar com os instrumentos adequados na nossa bancada de testes.'\n"
+        "   - Condução assertiva para a loja: Informe o endereço no Centro de Maricá e faça uma pergunta de fechamento convidando o cliente a vir ('Você consegue trazer o equipamento hoje ou prefere amanhã pela manhã para já abrirmos a sua Ordem de Serviço?')."
+    )
+
+    parts.append(
+        "\n🎧 TRATAMENTO DE MÍDIAS (ÁUDIO, FOTO E VÍDEO):\n"
+        "- ÁUDIO DO CLIENTE: O cliente frequentemente envia áudios de voz relatando o problema. O sistema transcreve o áudio para você. Ao responder, demonstre que ouviu com atenção ('Ouvi seu áudio com atenção...'), mencione resumidamente o sintoma relatado e direcione com firmeza para a bancada.\n"
+        "- FOTO DO CLIENTE: Se o cliente mandar foto do equipamento, tela com erro ou luzes piscando, o sistema descreve a imagem para você. Reconheça o recebimento com naturalidade ('Recebi a foto do seu equipamento...'), confirme que viu o estado, mas NUNCA invente a peça que estragou; reforce que o teste de bancada é indispensável.\n"
+        "- VÍDEO DO CLIENTE: Se o cliente mandar vídeo mostrando o aparelho ou o barulho, demonstre que assistiu ('Assisti ao vídeo que você enviou...'). Agradeça pelo registro visual e use-o para justificar que o aparelho não deve ser forçado e precisa vir para a loja."
+    )
+
+    parts.append(
+        "\n💬 DIRETRIZES DE ESTILO E COMUNICAÇÃO NO WHATSAPP:\n"
+        "1. Responda em no máximo 2 a 4 frases concisas, cordiais e acolhedoras. NUNCA envie textões longos nem listas burocráticas.\n"
+        "2. Confirme nossos serviços com firmeza e segurança ('Fazemos manutenção de impressoras Epson e HP sim!', 'Trabalhamos com conserto de notebooks, formatação e upgrade de SSD/memória sim!').\n"
+        "3. Preços e prazos: NUNCA invente preços fechados no escuro. Se perguntarem preço, diga com gentileza que a avaliação física na bancada é necessária para passar o orçamento justo e exato.\n"
+        "4. Perigo iminente (fumaça, cheiro de queimado, estalos, bateria estufada, líquido derramado): instrua a desligar imediatamente da tomada e não ligar mais até trazer na bancada.\n"
+        "5. Finalize sempre com uma pergunta de fechamento simpática para engajar o cliente a trazer a máquina."
     )
 
     # FAQs essenciais
@@ -1547,6 +1718,37 @@ def bot_process_conversation(session, cid, mode, send=True, advance=True):
         
         inbound_text = (last_in["body"] or "").strip()
 
+        # Ingestão Multimodal: Áudio (STT Whisper), Imagem (Visão Nemotron) e Vídeo (Áudio + Keyframe)
+        media_type = (last_in["media_type"] or "") if "media_type" in last_in.keys() else ""
+        has_media = bool(last_in["has_media"]) if "has_media" in last_in.keys() else False
+        media_url = last_in["media_url"] if "media_url" in last_in.keys() else None
+
+        if has_media:
+            m_bytes, m_mime, _ = waha_fetch_media_content(session, last_in["id"], cid=cid, media_url=media_url)
+            if m_bytes:
+                # 1. Áudio (PTT / Voice note / OGG / MP3 / WAV)
+                if any(x in media_type.lower() or x in (m_mime or "").lower() for x in ["audio", "ogg", "opus", "ptt"]):
+                    transcript = transcribe_audio_bytes(m_bytes, m_mime or "audio/ogg")
+                    if transcript:
+                        inbound_text = f"[Áudio de voz do cliente]: \"{transcript}\""
+                        with db() as c:
+                            c.execute("UPDATE messages SET body=? WHERE id=?", (f"[Áudio]: {transcript}", last_in["id"]))
+                    else:
+                        inbound_text = "[Áudio enviado pelo cliente - inaudível ou com ruído]"
+
+                # 2. Imagem (Foto de impressora, computador, tela azul, erro)
+                elif any(x in media_type.lower() or x in (m_mime or "").lower() for x in ["image", "jpeg", "jpg", "png", "webp"]):
+                    desc = describe_image_bytes(m_bytes, m_mime or "image/jpeg")
+                    caption_part = f" - Legenda: {inbound_text}" if inbound_text and inbound_text != "[midia]" and not inbound_text.startswith("image/") else ""
+                    inbound_text = f"[Foto enviada pelo cliente - Descrição visual: {desc or 'Equipamento ou tela'}{caption_part}]"
+
+                # 3. Vídeo (Falha, ruído, comportamento da máquina)
+                elif any(x in media_type.lower() or x in (m_mime or "").lower() for x in ["video", "mp4", "3gp", "mov"]):
+                    v_audio, v_desc = process_video_bytes(m_bytes, m_mime or "video/mp4")
+                    caption_part = f" - Legenda: {inbound_text}" if inbound_text and inbound_text != "[midia]" and not inbound_text.startswith("video/") else ""
+                    v_audio_part = f' | Áudio do vídeo: "{v_audio}"' if v_audio else ""
+                    inbound_text = f"[Vídeo enviado pelo cliente - Visual: {v_desc or 'Equipamento'}{v_audio_part}{caption_part}]"
+
         # Defense-in-depth safety checks
         if conv["mode"] != "bot":
             return {"cid": cid, "session": session, "action": "skip", "reason": "modo_humano"}
@@ -1652,53 +1854,18 @@ def bot_process_conversation(session, cid, mode, send=True, advance=True):
 
         # 3. ATENDIMENTO TÉCNICO VERTICALIZADO VIA LLM (OmniRoute)
         if not reply:
-            media_type = last_in["media_type"] if "media_type" in last_in.keys() else None
-            has_media = last_in["has_media"] if "has_media" in last_in.keys() else None
-            media_content = None
-            media_mime = None
-            if has_media and media_type:
-                media_bytes = waha_download_media(session, last_in["id"])
-                if media_bytes:
-                    media_content = media_bytes
-                    mime_map = {
-                        "image": "image/jpeg",
-                        "audio": "audio/ogg",
-                        "video": "video/mp4",
-                        "document": "application/pdf",
-                        "sticker": "image/webp",
-                    }
-                    media_mime = mime_map.get(media_type, "application/octet-stream")
-
             offer = free_slots(kb, session, limit=6)
             all_slots = free_slots(kb, session)
             chat = [{"role": "system", "content": build_system_prompt(kb, [slot_label(s) for s in offer], client_dir)}]
             for m in msgs:
                 role = "assistant" if m["from_me"] else "user"
-                content = (m["body"] or "[midia]")[:1000]
-                chat.append({"role": role, "content": content})
+                content = inbound_text if (not m["from_me"] and m["id"] == last_in["id"]) else (m["body"] or "[midia]")
+                chat.append({"role": role, "content": content[:1200]})
 
-            if media_content and media_mime:
-                import base64
-                b64 = base64.b64encode(media_content).decode()
-                for i in range(len(chat) - 1, -1, -1):
-                    if chat[i]["role"] == "user":
-                        chat[i] = {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": inbound_text or "[midia]"},
-                                {"type": "image_url" if media_mime.startswith("image") else "media",
-                                 "image_url" if media_mime.startswith("image") else "media": {
-                                     "url": f"data:{media_mime};base64,{b64}"
-                                 }}
-                            ]
-                        }
-                        break
-
-            model_for_media = "auto/best-vision" if media_content else None
             max_tokens_override = 800
 
-            _emit_bot_event(session, "bot_thinking", {"cid": cid, "inbound": inbound_text[:200], "has_media": bool(media_content)})
-            res = omni_chat(chat, model=model_for_media, max_tokens=max_tokens_override)
+            _emit_bot_event(session, "bot_thinking", {"cid": cid, "inbound": inbound_text[:200], "has_media": bool(has_media)})
+            res = omni_chat(chat, max_tokens=max_tokens_override)
             model_used = res.get("model")
 
             # Detecta intenção de agendamento
@@ -2438,8 +2605,10 @@ def api_conversation(cid):
 def api_media_get(session, mid):
     """Serve mídias (áudios, imagens, documentos) diretamente do WAHA."""
     with db() as c:
-        m = c.execute("SELECT media_type, body FROM messages WHERE id=? AND session=?", (mid, session)).fetchone()
+        m = c.execute("SELECT * FROM messages WHERE id=? AND session=?", (mid, session)).fetchone()
     content_type = "application/octet-stream"
+    cid = m["conversation_id"] if m and "conversation_id" in m.keys() else None
+    m_url = m["media_url"] if m and "media_url" in m.keys() else None
     if m and m["media_type"]:
         content_type = m["media_type"]
     elif m and m["body"] and m["body"].endswith(".jpg"):
@@ -2447,11 +2616,11 @@ def api_media_get(session, mid):
     elif m and m["body"] and m["body"].endswith(".ogg"):
         content_type = "audio/ogg"
     
-    data = waha_download_media(session, mid)
+    data, mime, _ = waha_fetch_media_content(session, mid, cid=cid, media_url=m_url)
     if not data:
         return jsonify({"error": "midia nao encontrada"}), 404
     from flask import Response
-    return Response(data, mimetype=content_type)
+    return Response(data, mimetype=mime or content_type)
 
 
 @app.post("/api/conversations/start")
@@ -2838,8 +3007,8 @@ def api_waha_sessions_integrate():
     return jsonify({"ok": True, "slug": slug, "client": cfg})
 
 
-CURRENT_APP_VERSION = "2.2.3"
-CURRENT_VERSION_CODE = 6
+CURRENT_APP_VERSION = "2.2.4"
+CURRENT_VERSION_CODE = 7
 STATIC_DIR = Path(__file__).parent / "static"
 
 @app.get("/api/app/version")
@@ -2864,7 +3033,7 @@ def api_app_version():
         "apk_url": "/static/InteligenciaDoTopo.apk",
         "apk_size": apk_size,
         "updated_at": apk_mtime,
-        "release_notes": "Versão 2.2.0: Identidade Inteligência do Topo, auto-updater, espelhamento WAHA em tempo real, suporte completo a áudio/mídia, integração de sessões ativas e Map-OS."
+        "release_notes": "Versão 2.2.4: Inteligência multimodal (Áudio STT Groq Whisper, Visão Nemotron, Vídeo áudio+frame) e foco em conversão de bancada SebastianCom sem diagnóstico prematuro."
     })
 
 

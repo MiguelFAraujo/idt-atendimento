@@ -19,8 +19,8 @@ echo "=== 3. Vinculando recursos e gerando R.java ==="
     --manifest "$PROJECT_DIR/android/AndroidManifest.xml" \
     --min-sdk-version 24 \
     --target-sdk-version 34 \
-    --version-code 6 \
-    --version-name "2.2.3" \
+    --version-code 7 \
+    --version-name "2.2.4" \
     -o "$WORK_DIR/unaligned.apk" \
     --java "$PROJECT_DIR/android/src" \
     --auto-add-overlay \
