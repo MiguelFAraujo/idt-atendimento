@@ -2693,8 +2693,8 @@ def api_waha_sessions_integrate():
     return jsonify({"ok": True, "slug": slug, "client": cfg})
 
 
-CURRENT_APP_VERSION = "2.2.0"
-CURRENT_VERSION_CODE = 3
+CURRENT_APP_VERSION = "2.2.1"
+CURRENT_VERSION_CODE = 4
 STATIC_DIR = Path(__file__).parent / "static"
 
 @app.get("/api/app/version")

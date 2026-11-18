@@ -31,8 +31,8 @@ public class MainActivity extends Activity {
     private final static int FILE_CHOOSER_RESULT_CODE = 1001;
 
     private static final String APP_URL = "https://idt-lab-core.tail97aa3e.ts.net:8480/";
-    public static final String APP_VERSION = "2.2.0";
-    public static final int APP_VERSION_CODE = 3;
+    public static final String APP_VERSION = "2.2.1";
+    public static final int APP_VERSION_CODE = 4;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {

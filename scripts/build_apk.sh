@@ -17,6 +17,10 @@ echo "=== 2. Compilando recursos com aapt2 ==="
 echo "=== 3. Vinculando recursos e gerando R.java ==="
 "$BUILD_TOOLS/aapt2" link -I "$ANDROID_JAR" \
     --manifest "$PROJECT_DIR/android/AndroidManifest.xml" \
+    --min-sdk-version 24 \
+    --target-sdk-version 34 \
+    --version-code 4 \
+    --version-name "2.2.1" \
     -o "$WORK_DIR/unaligned.apk" \
     --java "$PROJECT_DIR/android/src" \
     --auto-add-overlay \
